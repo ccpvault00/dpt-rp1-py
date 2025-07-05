@@ -23,6 +23,7 @@ from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 from pathlib import Path
 from collections import defaultdict
+import fnmatch
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -571,6 +572,7 @@ class DigitalPaper:
 
     def sync(self, local_folder, remote_folder):
         checkpoint_info = self.load_checkpoint(local_folder)
+        ignore_patterns = self.load_ignore_patterns(local_folder)
         self.set_datetime()
         self.new_folder(remote_folder)
         print("Looking for changes on device... ", end="", flush=True)
@@ -615,6 +617,13 @@ class DigitalPaper:
                             f["modified_date"], "%Y-%m-%dT%H:%M:%SZ"
                         )
                         file_data[path][f"{location}_time"] = modification_time
+                        
+                        # Mark if this file is ignored (but still track it)
+                        if location == "remote":
+                            relative_path = str(Path(path).relative_to(remote_folder))
+                            if self.is_ignored(relative_path, ignore_patterns):
+                                file_data[path]["ignored"] = True
+                                
                     elif f["entry_type"] == "folder":
                         folder_data[path][f"{location}_exists"] = True
 
@@ -623,7 +632,12 @@ class DigitalPaper:
         # Use relatively low-level os.scandir()-api instead of a higher-level api such as glob.glob()
         # because os.scandir() gives access to mtime without having to perform an additional syscall on Windows,
         # leading to much faster scanning times on Windows
+        
+        # Track ignored files count during traversal instead of re-scanning
+        ignored_count = 0
+        
         def traverse_local_folder(path):
+            nonlocal ignored_count
             # Let's store to folder_data that this folder exists
             relative_path = Path(path).relative_to(local_folder)
             remote_path = normalize_path(
@@ -644,8 +658,18 @@ class DigitalPaper:
                     )
                     modification_time = datetime.utcfromtimestamp(entry.stat().st_mtime)
                     file_data[remote_path]["local_time"] = modification_time
+                    
+                    # Mark if this file is ignored (but still track it)
+                    if self.is_ignored(str(relative_path), ignore_patterns):
+                        file_data[remote_path]["ignored"] = True
+                        ignored_count += 1
 
         traverse_local_folder(local_folder)
+        
+        # Show ignored files count
+        if ignored_count > 0:
+            print(f"Found {ignored_count} ignored files (use list-ignored-files to see them)")
+        
         print("done")
 
         # Let's loop through the data structure
@@ -658,6 +682,10 @@ class DigitalPaper:
         missing_checkpoint_files = []
 
         for filename, data in file_data.items():
+            # Skip ignored files completely from sync decisions
+            if data.get("ignored", False):
+                continue
+                
             if data["checkpoint_time"] is None:
                 if data["remote_time"] and data["local_time"]:
                     # File exists both on device and locally, but not in checkpoint.
@@ -784,6 +812,12 @@ class DigitalPaper:
         for file_list, description in actions:
             if file_list:
                 print(f"{len(file_list):4d} files will be {description}")
+        
+        # Show ignored files count
+        if ignore_patterns:
+            ignored_files = self.list_ignored_files(local_folder)
+            if ignored_files:
+                print(f"{len(ignored_files):4d} files are IGNORED (use list-ignored-files to see them)")
 
         if not (
             to_delete_local
@@ -803,7 +837,7 @@ class DigitalPaper:
         print("")
         confirm = ""
         while not (confirm in ("y", "yes") or self.assume_yes):
-            confirm = input(f"Proceed (y/n/?)? ")
+            confirm = input(f"Proceed (y/n/?/ig)? ")
             if confirm in ("n", "no"):
                 return
             if confirm in ("?", "list", "l"):
@@ -813,6 +847,62 @@ class DigitalPaper:
                         print(f"The following files will be {description}:")
                         print("\t" + "\n\t".join(file_list))
                         print("")
+            if confirm in ("ig", "ignore"):
+                # Show files that can be ignored (upload and download files)
+                files_to_ignore = []
+                file_sources = []  # Track whether each file is from upload or download
+                
+                if to_upload:
+                    print("\nFiles to be UPLOADED (can be ignored):")
+                    for i, file_path in enumerate(to_upload):
+                        print(f"{len(files_to_ignore)+1:3d}: {file_path} [UPLOAD]")
+                        files_to_ignore.append(file_path)
+                        file_sources.append('upload')
+                
+                if to_download:
+                    print("\nFiles to be DOWNLOADED (can be ignored):")
+                    for i, file_path in enumerate(to_download):
+                        print(f"{len(files_to_ignore)+1:3d}: {file_path} [DOWNLOAD]")
+                        files_to_ignore.append(file_path)
+                        file_sources.append('download')
+                
+                if files_to_ignore:
+                    print("\nEnter file numbers to ignore (space-separated, e.g., '1 3 5'), or 'all' for all files:")
+                    selection = input("Files to ignore: ").strip()
+                    
+                    if selection.lower() == 'all':
+                        # Add all files to ignore
+                        ignored_count = 0
+                        for file_path in files_to_ignore:
+                            relative_path = str(Path(file_path).relative_to(remote_folder))
+                            filename = os.path.basename(relative_path)
+                            if self.add_ignore_pattern(local_folder, filename):
+                                ignored_count += 1
+                        print(f"Added {ignored_count} files to ignore list")
+                    elif selection:
+                        try:
+                            indices = [int(x) - 1 for x in selection.split()]
+                            ignored_count = 0
+                            for idx in indices:
+                                if 0 <= idx < len(files_to_ignore):
+                                    file_path = files_to_ignore[idx]
+                                    relative_path = str(Path(file_path).relative_to(remote_folder))
+                                    filename = os.path.basename(relative_path)
+                                    if self.add_ignore_pattern(local_folder, filename):
+                                        ignored_count += 1
+                                        source = file_sources[idx].upper()
+                                        print(f"Added to ignore: {filename} [{source}]")
+                            print(f"Added {ignored_count} files to ignore list")
+                        except ValueError:
+                            print("Invalid selection. Please enter numbers separated by spaces.")
+                    
+                    # Ask if user wants to restart sync with new ignore patterns
+                    restart = input("Restart sync with new ignore patterns? (y/n): ").strip().lower()
+                    if restart in ("y", "yes"):
+                        print("Restarting sync...")
+                        return self.sync(local_folder, remote_folder)
+                else:
+                    print("No files available to ignore.")
 
         # Syncing can potentially take some time, so let's display a progress bar
         # to give the user some idea about the progress.
@@ -920,6 +1010,73 @@ class DigitalPaper:
         checkpoint_file = os.path.join(local_folder, ".sync")
         with open(checkpoint_file, "wb") as f:
             pickle.dump(doclist, f)
+
+    def load_ignore_patterns(self, local_folder):
+        """Load ignore patterns from .syncignore file"""
+        ignore_file = os.path.join(local_folder, ".syncignore")
+        if not os.path.exists(ignore_file):
+            return []
+        
+        patterns = []
+        with open(ignore_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+        return patterns
+
+    def save_ignore_patterns(self, local_folder, patterns):
+        """Save ignore patterns to .syncignore file"""
+        ignore_file = os.path.join(local_folder, ".syncignore")
+        with open(ignore_file, "w") as f:
+            for pattern in patterns:
+                f.write(pattern + "\n")
+
+    def add_ignore_pattern(self, local_folder, pattern):
+        """Add a pattern to the ignore list"""
+        patterns = self.load_ignore_patterns(local_folder)
+        if pattern not in patterns:
+            patterns.append(pattern)
+            self.save_ignore_patterns(local_folder, patterns)
+            return True
+        return False
+
+    def remove_ignore_pattern(self, local_folder, pattern):
+        """Remove a pattern from the ignore list"""
+        patterns = self.load_ignore_patterns(local_folder)
+        if pattern in patterns:
+            patterns.remove(pattern)
+            self.save_ignore_patterns(local_folder, patterns)
+            return True
+        return False
+
+    def is_ignored(self, file_path, patterns):
+        """Check if a file path matches any ignore pattern"""
+        filename = os.path.basename(file_path)
+        for pattern in patterns:
+            if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(file_path, pattern):
+                return True
+        return False
+
+    def list_ignored_files(self, local_folder):
+        """List all files that would be ignored during sync"""
+        patterns = self.load_ignore_patterns(local_folder)
+        if not patterns:
+            return []
+        
+        ignored_files = []
+        
+        def traverse_for_ignored(path):
+            for entry in os.scandir(path):
+                if entry.is_dir():
+                    traverse_for_ignored(entry.path)
+                elif entry.name.lower().endswith(".pdf") and not entry.name.startswith("."):
+                    relative_path = Path(entry.path).relative_to(local_folder)
+                    if self.is_ignored(str(relative_path), patterns):
+                        ignored_files.append(str(relative_path))
+        
+        traverse_for_ignored(local_folder)
+        return ignored_files
 
     def _copy_move_data(self, file_id, folder_id, new_filename=None):
         data = {"parent_folder_id": folder_id}

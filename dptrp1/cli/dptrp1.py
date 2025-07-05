@@ -142,6 +142,62 @@ def do_sync(d, local_path, remote_path="Document"):
     d.sync(local_path, remote_path)
 
 
+def do_add_ignore(d, local_path, pattern):
+    """
+    Add a file pattern to the sync ignore list for the given local folder.
+    Files matching this pattern will be skipped during sync operations.
+    Patterns support wildcards (* and ?).
+    
+    Example: dptrp1 add-ignore ~/Dropbox/Papers "*.tmp"
+    """
+    if d.add_ignore_pattern(local_path, pattern):
+        print(f"Added ignore pattern: {pattern}")
+    else:
+        print(f"Pattern already exists: {pattern}")
+
+
+def do_remove_ignore(d, local_path, pattern):
+    """
+    Remove a file pattern from the sync ignore list for the given local folder.
+    
+    Example: dptrp1 remove-ignore ~/Dropbox/Papers "*.tmp"
+    """
+    if d.remove_ignore_pattern(local_path, pattern):
+        print(f"Removed ignore pattern: {pattern}")
+    else:
+        print(f"Pattern not found: {pattern}")
+
+
+def do_list_ignore(d, local_path):
+    """
+    List all ignore patterns for the given local folder.
+    
+    Example: dptrp1 list-ignore ~/Dropbox/Papers
+    """
+    patterns = d.load_ignore_patterns(local_path)
+    if patterns:
+        print("Ignore patterns:")
+        for pattern in patterns:
+            print(f"  {pattern}")
+    else:
+        print("No ignore patterns configured.")
+
+
+def do_list_ignored_files(d, local_path):
+    """
+    List all files that would be ignored during sync for the given local folder.
+    
+    Example: dptrp1 list-ignored-files ~/Dropbox/Papers
+    """
+    ignored_files = d.list_ignored_files(local_path)
+    if ignored_files:
+        print("Ignored files:")
+        for file_path in ignored_files:
+            print(f"  {file_path}")
+    else:
+        print("No files are currently ignored.")
+
+
 def do_new_folder(d, remote_path):
     d.new_folder(add_prefix(remote_path))
 
@@ -286,6 +342,10 @@ commands = {
     "register": do_register,
     "update-firmware": do_update_firmware,
     "sync": do_sync,
+    "add-ignore": do_add_ignore,
+    "remove-ignore": do_remove_ignore,
+    "list-ignore": do_list_ignore,
+    "list-ignored-files": do_list_ignored_files,
     "help": do_help,
     "display-document": do_display_document,
     "get-configuration": do_get_config,
