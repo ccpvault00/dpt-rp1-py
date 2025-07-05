@@ -433,6 +433,13 @@ def main():
 
     try:
         commands[args.command](dp, *args.command_args)
+    except RecursionError as e:
+        import traceback
+        print("RecursionError occurred:", e, file=sys.stderr)
+        print("Full traceback:", file=sys.stderr)
+        traceback.print_exc()
+        print("For help, call:", sys.argv[0], "help", args.command)
+        sys.exit(1)
     except Exception as e:
         print("An error occured:", e, file=sys.stderr)
         print("For help, call:", sys.argv[0], "help", args.command)

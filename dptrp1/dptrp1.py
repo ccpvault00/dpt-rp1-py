@@ -414,14 +414,30 @@ class DigitalPaper:
         # It is slower because the main overhead when communicating with the DPT-RP1 is the request latency,
         # and this recursive implementation makes one request per folder. However, the faster implementation
         # above fails when there are more than 1300 items, in which case we fall back to this older implementation
-        def traverse(obj):
+        visited_folders = set()  # Track visited folders to prevent infinite recursion
+        
+        def traverse(obj, depth=0):
+            # Prevent infinite recursion due to circular references or deep nesting
+            if depth > 100:  # Maximum recursion depth
+                return [obj] if obj['entry_type'] == 'document' else [obj]
+                
             if obj['entry_type'] == 'document':
                 return [obj]
             else:
-                children = self \
-                  ._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = obj['entry_id'])) \
-                  .json()['entry_list']
-                return [obj] + functools.reduce(lambda acc, c: traverse(c) + acc, children[::-1], [])
+                # Check if we've already visited this folder
+                folder_id = obj.get('entry_id')
+                if folder_id in visited_folders:
+                    return [obj]  # Already visited, return just the folder
+                visited_folders.add(folder_id)
+                
+                try:
+                    children = self \
+                      ._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = obj['entry_id'])) \
+                      .json()['entry_list']
+                    return [obj] + functools.reduce(lambda acc, c: traverse(c, depth + 1) + acc, children[::-1], [])
+                except Exception:
+                    # If we can't access the folder, just return the folder itself
+                    return [obj]
         return traverse(self._resolve_object_by_path(remote_path))
 
 
@@ -512,12 +528,22 @@ class DigitalPaper:
         self._put_endpoint(doc_url, files=files)
 
     def new_folder(self, remote_path):
+        # Normalize path and remove trailing slashes
+        remote_path = remote_path.rstrip('/')
+        if not remote_path or remote_path == '/':
+            return  # Don't try to create root directory
+            
         folder_name = os.path.basename(remote_path)
         remote_directory = os.path.dirname(remote_path)
-        if not remote_directory:
+        
+        # Prevent infinite recursion - stop at root or empty directory
+        if not remote_directory or remote_directory == '/' or remote_directory == remote_path:
             return
+            
+        # Check if the parent directory exists, and create it if needed
         if not self.path_exists(remote_directory):
             self.new_folder(remote_directory)
+            
         directory_id = self._get_object_id(remote_directory)
         info = {"folder_name": folder_name, "parent_folder_id": directory_id}
 
@@ -635,34 +661,49 @@ class DigitalPaper:
         
         # Track ignored files count during traversal instead of re-scanning
         ignored_count = 0
+        visited_paths = set()  # Track visited directories to prevent infinite recursion
         
-        def traverse_local_folder(path):
+        def traverse_local_folder(path, depth=0):
             nonlocal ignored_count
-            # Let's store to folder_data that this folder exists
-            relative_path = Path(path).relative_to(local_folder)
-            remote_path = normalize_path(
-                (Path(remote_folder) / relative_path).as_posix()
-            )
-            folder_data[remote_path]["local_exists"] = True
-            # And recursively go through all items inside of the folder
-            for entry in os.scandir(path):
-                if entry.is_dir():
-                    traverse_local_folder(entry.path)
-                # Only handle PDF files, ignore files starting with a dot.
-                elif entry.name.lower().endswith(".pdf") and not entry.name.startswith(
-                    "."
-                ):
-                    relative_path = Path(entry.path).relative_to(local_folder)
-                    remote_path = normalize_path(
-                        (Path(remote_folder) / relative_path).as_posix()
-                    )
-                    modification_time = datetime.utcfromtimestamp(entry.stat().st_mtime)
-                    file_data[remote_path]["local_time"] = modification_time
-                    
-                    # Mark if this file is ignored (but still track it)
-                    if self.is_ignored(str(relative_path), ignore_patterns):
-                        file_data[remote_path]["ignored"] = True
-                        ignored_count += 1
+            # Prevent infinite recursion due to circular symlinks or deep nesting
+            if depth > 100:  # Maximum recursion depth
+                return
+                
+            try:
+                # Get the real path to handle symlinks
+                real_path = os.path.realpath(path)
+                if real_path in visited_paths:
+                    return  # Already visited this directory
+                visited_paths.add(real_path)
+                
+                # Let's store to folder_data that this folder exists
+                relative_path = Path(path).relative_to(local_folder)
+                remote_path = normalize_path(
+                    (Path(remote_folder) / relative_path).as_posix()
+                )
+                folder_data[remote_path]["local_exists"] = True
+                # And recursively go through all items inside of the folder
+                for entry in os.scandir(path):
+                    if entry.is_dir():
+                        traverse_local_folder(entry.path, depth + 1)
+                    # Only handle PDF files, ignore files starting with a dot.
+                    elif entry.name.lower().endswith(".pdf") and not entry.name.startswith(
+                        "."
+                    ):
+                        relative_path = Path(entry.path).relative_to(local_folder)
+                        remote_path = normalize_path(
+                            (Path(remote_folder) / relative_path).as_posix()
+                        )
+                        modification_time = datetime.utcfromtimestamp(entry.stat().st_mtime)
+                        file_data[remote_path]["local_time"] = modification_time
+                        
+                        # Mark if this file is ignored (but still track it)
+                        if self.is_ignored(str(relative_path), ignore_patterns):
+                            file_data[remote_path]["ignored"] = True
+                            ignored_count += 1
+            except (OSError, ValueError):
+                # Skip directories that can't be accessed or processed
+                pass
 
         traverse_local_folder(local_folder)
         
@@ -1065,15 +1106,30 @@ class DigitalPaper:
             return []
         
         ignored_files = []
+        visited_paths = set()  # Track visited directories to prevent infinite recursion
         
-        def traverse_for_ignored(path):
-            for entry in os.scandir(path):
-                if entry.is_dir():
-                    traverse_for_ignored(entry.path)
-                elif entry.name.lower().endswith(".pdf") and not entry.name.startswith("."):
-                    relative_path = Path(entry.path).relative_to(local_folder)
-                    if self.is_ignored(str(relative_path), patterns):
-                        ignored_files.append(str(relative_path))
+        def traverse_for_ignored(path, depth=0):
+            # Prevent infinite recursion due to circular symlinks or deep nesting
+            if depth > 100:  # Maximum recursion depth
+                return
+                
+            try:
+                # Get the real path to handle symlinks
+                real_path = os.path.realpath(path)
+                if real_path in visited_paths:
+                    return  # Already visited this directory
+                visited_paths.add(real_path)
+                
+                for entry in os.scandir(path):
+                    if entry.is_dir():
+                        traverse_for_ignored(entry.path, depth + 1)
+                    elif entry.name.lower().endswith(".pdf") and not entry.name.startswith("."):
+                        relative_path = Path(entry.path).relative_to(local_folder)
+                        if self.is_ignored(str(relative_path), patterns):
+                            ignored_files.append(str(relative_path))
+            except (OSError, ValueError):
+                # Skip directories that can't be accessed or processed
+                pass
         
         traverse_for_ignored(local_folder)
         return ignored_files
