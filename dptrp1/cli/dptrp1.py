@@ -130,7 +130,7 @@ def do_delete_folder(d, remote_path):
     d.delete_folder(add_prefix(remote_path))
 
 
-def do_sync(d, local_path, remote_path="Document"):
+def do_sync(d, local_path, remote_path="Document", workers=4):
     """
     Synchronize all PDF documents between a local path (on your PC) and a
     remote path (on the DPT). Older documents will be overwritten by newer ones
@@ -139,7 +139,7 @@ def do_sync(d, local_path, remote_path="Document"):
 
     Example: dptrp1 sync ~/Dropbox/Papers Document/Papers
     """
-    d.sync(local_path, remote_path)
+    d.sync(local_path, remote_path, workers=workers)
 
 
 def do_add_ignore(d, local_path, pattern):
@@ -387,6 +387,13 @@ def build_parser():
         dest="quiet",
         default=False,
     )
+    p.add_argument(
+        "--workers",
+        help="Number of parallel file transfers during sync (default: 4).",
+        type=int,
+        default=4,
+        dest="workers",
+    )
     p.add_argument("command", help="Command to run", choices=sorted(commands.keys()))
     p.add_argument("command_args", help="Arguments for the command", nargs="*")
     return p
@@ -432,7 +439,10 @@ def main():
     dp.authenticate(client_id, key)
 
     try:
-        commands[args.command](dp, *args.command_args)
+        if args.command == "sync":
+            do_sync(dp, *args.command_args, workers=args.workers)
+        else:
+            commands[args.command](dp, *args.command_args)
     except RecursionError as e:
         import traceback
         print("RecursionError occurred:", e, file=sys.stderr)

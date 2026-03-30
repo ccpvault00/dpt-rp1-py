@@ -25,8 +25,47 @@ from Crypto.PublicKey import RSA
 from pathlib import Path
 from collections import defaultdict
 import fnmatch
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Thread-safe IPv6 link-local scope ID support for urllib3 2.x.
+# Patched once at import time; each adapter instance sets a thread-local
+# scope_id before calling super().send() so concurrent threads don't race
+# on a shared global.
+import urllib3.util.connection as _urllib3_conn
+
+_ipv6_tls = threading.local()
+
+if not getattr(_urllib3_conn, "_scoped_patched", False):
+    _orig_create_connection = _urllib3_conn.create_connection
+
+    def _scoped_create_connection(address, *a, **kw):
+        scope_id = getattr(_ipv6_tls, "scope_id", None)
+        if scope_id is not None:
+            host, port = address
+            host = host.strip("[]")
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.connect((host, port, 0, scope_id))
+            return sock
+        return _orig_create_connection(address, *a, **kw)
+
+    _urllib3_conn.create_connection = _scoped_create_connection
+    _urllib3_conn._scoped_patched = True
+
+
+class _IPv6ScopeAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, scope_id):
+        super().__init__()
+        self._scope_id = scope_id
+
+    def send(self, request, *args, **kwargs):
+        _ipv6_tls.scope_id = self._scope_id
+        try:
+            return super().send(request, *args, **kwargs)
+        finally:
+            _ipv6_tls.scope_id = None
 
 
 def get_default_auth_files():
@@ -176,27 +215,7 @@ class DigitalPaper:
             ipv6_addr, iface = raw.split("%", 1)
             self.addr = "[{}]".format(ipv6_addr)
             scope_id = socket.if_nametoindex(iface)
-
-            import urllib3.util.connection as _urllib3_conn
-
-            class _IPv6ScopeAdapter(requests.adapters.HTTPAdapter):
-                def send(self_inner, request, *args, **kwargs):
-                    _orig = _urllib3_conn.create_connection
-
-                    def _scoped(address, *a, **kw):
-                        host, port = address
-                        host = host.strip("[]")
-                        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-                        sock.connect((host, port, 0, scope_id))
-                        return sock
-
-                    _urllib3_conn.create_connection = _scoped
-                    try:
-                        return super().send(request, *args, **kwargs)
-                    finally:
-                        _urllib3_conn.create_connection = _orig
-
-            self.session.mount("https://", _IPv6ScopeAdapter())
+            self.session.mount("https://", _IPv6ScopeAdapter(scope_id))
 
     @property
     def base_url(self):
@@ -629,7 +648,7 @@ class DigitalPaper:
             return False
         return True
 
-    def sync(self, local_folder, remote_folder):
+    def sync(self, local_folder, remote_folder, workers=4):
         checkpoint_info = self.load_checkpoint(local_folder)
         ignore_patterns = self.load_ignore_patterns(local_folder)
         self.set_datetime()
@@ -992,7 +1011,7 @@ class DigitalPaper:
         )
 
         # Apply changes in remote to local
-        for remote_path in to_download:
+        def _download_one(remote_path):
             relative_path = Path(remote_path).relative_to(remote_folder)
             local_path = Path(local_folder) / relative_path
             tqdm.write("⇣ " + str(remote_path))
@@ -1005,6 +1024,10 @@ class DigitalPaper:
             mod_time = time.mktime(remote_time.timetuple())
             os.utime(local_path, (mod_time, mod_time))
             progress_bar.update()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for f in as_completed([pool.submit(_download_one, p) for p in to_download]):
+                f.result()
 
         for remote_path in to_delete_local:
             relative_path = Path(remote_path).relative_to(remote_folder)
@@ -1050,12 +1073,16 @@ class DigitalPaper:
                 self.delete_folder(remote_deletion_folder)
             progress_bar.update()
 
-        for remote_path in to_upload:
+        def _upload_one(remote_path):
             relative_path = Path(remote_path).relative_to(remote_folder)
             local_path = Path(local_folder) / relative_path
             tqdm.write("⇡ " + str(local_path))
             self.upload_file(local_path, remote_path)
             progress_bar.update()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for f in as_completed([pool.submit(_upload_one, p) for p in to_upload]):
+                f.result()
 
         for remote_path in folders_to_create_remote:
             relative_path = Path(remote_path).relative_to(remote_folder)
