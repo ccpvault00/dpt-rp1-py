@@ -4,6 +4,7 @@ import sys
 import uuid
 import time
 import base64
+import socket
 import httpsig
 import urllib3
 import requests
@@ -164,6 +165,38 @@ class DigitalPaper:
         self.session = requests.Session()
         self.session.verify = False  # disable ssl certificate verification
         self.assume_yes = assume_yes  # Whether to disable interactive prompts (currently only in sync())
+
+        # urllib3 2.x cannot handle IPv6 link-local addresses with zone IDs (e.g.
+        # fe80::1%eth0) in URLs. If the address contains a '%', extract the zone ID,
+        # rewrite self.addr to the bare IPv6 form for URL construction, and mount a
+        # custom HTTPAdapter that passes the scope_id directly to the socket via the
+        # 4-tuple (host, port, flowinfo, scope_id) form required by the kernel.
+        raw = self.addr.strip("[]")
+        if "%" in raw:
+            ipv6_addr, iface = raw.split("%", 1)
+            self.addr = "[{}]".format(ipv6_addr)
+            scope_id = socket.if_nametoindex(iface)
+
+            import urllib3.util.connection as _urllib3_conn
+
+            class _IPv6ScopeAdapter(requests.adapters.HTTPAdapter):
+                def send(self_inner, request, *args, **kwargs):
+                    _orig = _urllib3_conn.create_connection
+
+                    def _scoped(address, *a, **kw):
+                        host, port = address
+                        host = host.strip("[]")
+                        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                        sock.connect((host, port, 0, scope_id))
+                        return sock
+
+                    _urllib3_conn.create_connection = _scoped
+                    try:
+                        return super().send(request, *args, **kwargs)
+                    finally:
+                        _urllib3_conn.create_connection = _orig
+
+            self.session.mount("https://", _IPv6ScopeAdapter())
 
     @property
     def base_url(self):
