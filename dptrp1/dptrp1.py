@@ -462,35 +462,43 @@ class DigitalPaper:
         )
     
     def traverse_folder_recursively(self, remote_path):
-        # This is the old recursive implementation of traverse_folder.
-        # It is slower because the main overhead when communicating with the DPT-RP1 is the request latency,
-        # and this recursive implementation makes one request per folder. However, the faster implementation
-        # above fails when there are more than 1300 items, in which case we fall back to this older implementation
-        visited_folders = set()  # Track visited folders to prevent infinite recursion
-        
-        def traverse(obj, depth=0):
-            # Prevent infinite recursion due to circular references or deep nesting
-            if depth > 100:  # Maximum recursion depth
-                return [obj] if obj['entry_type'] == 'document' else [obj]
-                
-            if obj['entry_type'] == 'document':
-                return [obj]
-            else:
-                # Check if we've already visited this folder
-                folder_id = obj.get('entry_id')
-                if folder_id in visited_folders:
-                    return [obj]  # Already visited, return just the folder
-                visited_folders.add(folder_id)
-                
-                try:
-                    children = self \
-                      ._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = obj['entry_id'])) \
-                      .json()['entry_list']
-                    return [obj] + functools.reduce(lambda acc, c: traverse(c, depth + 1) + acc, children[::-1], [])
-                except Exception:
-                    # If we can't access the folder, just return the folder itself
-                    return [obj]
-        return traverse(self._resolve_object_by_path(remote_path))
+        # This is the fallback implementation used when the device has more than ~1300 items and the
+        # fast single-request path truncates results. Instead of sequential DFS (one API call per folder,
+        # each blocking on WiFi round-trip latency), we use parallel BFS: all folders at the same depth
+        # level are fetched concurrently, reducing total scan time from O(N_folders * latency) to
+        # approximately O(depth * latency).
+        visited_folders = set()
+        all_entries = []
+
+        def fetch_children(folder_obj):
+            folder_id = folder_obj.get('entry_id')
+            try:
+                children = self._get_endpoint(
+                    "/folders/{remote_id}/entries2".format(remote_id=folder_id)
+                ).json()['entry_list']
+                return children
+            except Exception:
+                return []
+
+        root = self._resolve_object_by_path(remote_path)
+        all_entries.append(root)
+        pending_folders = [root] if root['entry_type'] == 'folder' else []
+        visited_folders.add(root.get('entry_id'))
+
+        while pending_folders:
+            next_pending = []
+            with ThreadPoolExecutor(max_workers=min(32, len(pending_folders))) as executor:
+                futures = {executor.submit(fetch_children, f): f for f in pending_folders}
+                for future in as_completed(futures):
+                    for child in future.result():
+                        all_entries.append(child)
+                        child_id = child.get('entry_id')
+                        if child['entry_type'] == 'folder' and child_id not in visited_folders:
+                            visited_folders.add(child_id)
+                            next_pending.append(child)
+            pending_folders = next_pending
+
+        return all_entries
 
 
     def list_document_info(self, remote_path):
