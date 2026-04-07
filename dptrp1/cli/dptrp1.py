@@ -7,6 +7,7 @@ import json
 import sys
 import os
 import re
+import traceback
 
 from pathlib import Path
 from dptrp1.dptrp1 import DigitalPaper, find_auth_files, get_default_auth_files
@@ -137,6 +138,13 @@ def do_sync(d, local_path, remote_path="Document", workers=4):
     without any additional warning. Also synchronizes the time and date on the
     reader to the computer's time and date.
 
+    At the confirmation prompt:
+      y / yes  Proceed with the sync
+      n / no   Cancel the sync
+      ?        Show the full list of files that will be changed
+      ig       Interactive ignore: select files to exclude from this and future syncs
+               (adds filename patterns to .syncignore in the local folder)
+
     Example: dptrp1 sync ~/Dropbox/Papers Document/Papers
     """
     d.sync(local_path, remote_path, workers=workers)
@@ -147,7 +155,11 @@ def do_add_ignore(d, local_path, pattern):
     Add a file pattern to the sync ignore list for the given local folder.
     Files matching this pattern will be skipped during sync operations.
     Patterns support wildcards (* and ?).
-    
+
+    Warning: patterns are matched against the filename only, not the full path.
+    The pattern "subdir/thesis.pdf" stores "thesis.pdf" and will ignore ALL files
+    named "thesis.pdf" in any subdirectory. Use "list-ignored-files" to verify.
+
     Example: dptrp1 add-ignore ~/Dropbox/Papers "*.tmp"
     """
     if d.add_ignore_pattern(local_path, pattern):
@@ -186,7 +198,9 @@ def do_list_ignore(d, local_path):
 def do_list_ignored_files(d, local_path):
     """
     List all files that would be ignored during sync for the given local folder.
-    
+
+    Note: only PDF files are listed, since sync only transfers PDF files.
+
     Example: dptrp1 list-ignored-files ~/Dropbox/Papers
     """
     ignored_files = d.list_ignored_files(local_path)
@@ -224,33 +238,16 @@ def do_wifi_disable(d):
     print(d.disable_wifi())
 
 
-def do_add_wifi(d, cfg_file=""):
-    try:
-        cfg = json.load(open(cfg_file))
-    except JSONDecodeError:
-        quit("JSONDecodeError: Check the contents of %s" % cfg_file)
-    except FileNotFoundError:
-        quit("File Not Found: %s" % cfg_file)
-    if not cfg:
-        print(
-            d.configure_wifi(
-                ssid="vecna2",
-                security="psk",
-                passwd="elijah is a cat",
-                dhcp="true",
-                static_address="",
-                gateway="",
-                network_mask="",
-                dns1="",
-                dns2="",
-                proxy="false",
-            )
-        )
-    else:
-        print(d.configure_wifi(**cfg))
+def do_add_wifi(d, cfg_file):
+    """
+    Configure WiFi on the device using a JSON configuration file.
 
+    The JSON file should contain the following fields:
+        ssid, security, passwd, dhcp, static_address, gateway,
+        network_mask, dns1, dns2, proxy
 
-def do_delete_wifi(d, cfg_file=""):
+    Example: dptrp1 wifi-add ~/wifi_config.json
+    """
     try:
         cfg = json.load(open(cfg_file))
     except ValueError:
@@ -258,9 +255,27 @@ def do_delete_wifi(d, cfg_file=""):
     except FileNotFoundError:
         quit("File Not Found: %s" % cfg_file)
     if not cfg:
-        print(d.delete_wifi(ssid="vecna2", security="psk"))
-    else:
-        print(d.delete_wifi(**cfg))
+        quit("Error: WiFi config file is empty: %s" % cfg_file)
+    print(d.configure_wifi(**cfg))
+
+
+def do_delete_wifi(d, cfg_file):
+    """
+    Remove a WiFi network from the device using a JSON configuration file.
+
+    The JSON file must contain at least: ssid, security
+
+    Example: dptrp1 wifi-del ~/wifi_config.json
+    """
+    try:
+        cfg = json.load(open(cfg_file))
+    except ValueError:
+        quit("JSONDecodeError: Check the contents of %s" % cfg_file)
+    except FileNotFoundError:
+        quit("File Not Found: %s" % cfg_file)
+    if not cfg:
+        quit("Error: WiFi config file is empty: %s" % cfg_file)
+    print(d.delete_wifi(**cfg))
 
 
 def do_register(d, key_file, id_file):
@@ -389,8 +404,8 @@ def build_parser():
     )
     p.add_argument(
         "--workers",
-        help="Number of parallel file transfers during sync (default: 4).",
-        type=int,
+        help="Number of parallel file transfers during sync (1-32, default: 4). Only applies to the sync command.",
+        type=lambda x: max(1, min(32, int(x))),
         default=4,
         dest="workers",
     )
@@ -444,9 +459,7 @@ def main():
         else:
             commands[args.command](dp, *args.command_args)
     except RecursionError as e:
-        import traceback
         print("RecursionError occurred:", e, file=sys.stderr)
-        print("Full traceback:", file=sys.stderr)
         traceback.print_exc()
         print("For help, call:", sys.argv[0], "help", args.command)
         sys.exit(1)
