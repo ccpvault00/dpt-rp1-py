@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
-import os
-import sys
-import uuid
-import time
 import base64
-import socket
-import httpsig
-import urllib3
-import requests
-import functools
-import unicodedata
-import pickle
-import shutil
-from tqdm import tqdm
-from glob import glob
-from urllib.parse import quote_plus
-from dptrp1.pyDH import DiffieHellman
-from datetime import datetime, timezone
-from pbkdf2 import PBKDF2
-from Crypto.Hash import SHA256
-from Crypto.Hash.HMAC import HMAC
-from Crypto.Cipher import AES
-from Crypto.PublicKey import RSA
-from pathlib import Path
-from collections import defaultdict
 import errno
 import fnmatch
 import logging
+import os
+import pickle
+import socket
+import sys
 import threading
+import time
+import unicodedata
+import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from glob import glob
+from pathlib import Path
+from urllib.parse import quote_plus
+
+import httpsig
+import requests
+import urllib3
+import urllib3.util.connection as _urllib3_conn
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+from Crypto.Hash.HMAC import HMAC
+from Crypto.PublicKey import RSA
+from pbkdf2 import PBKDF2
+from tqdm import tqdm
+
+from dptrp1.pyDH import DiffieHellman
 
 _MAX_LOCAL_TRAVERSAL_DEPTH = 100
 
@@ -38,8 +39,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Patched once at import time; each adapter instance sets a thread-local
 # scope_id before calling super().send() so concurrent threads don't race
 # on a shared global.
-import urllib3.util.connection as _urllib3_conn
-
 _ipv6_tls = threading.local()
 
 if not getattr(_urllib3_conn, "_scoped_patched", False):
@@ -182,7 +181,7 @@ class LookUpDPT:
         wait = self.lock.acquire(timeout=timeout) or (self.addr is not None)
         zc.close()
         if not wait:
-            print("Failed".format(timeout))
+            print("Failed")
             return None
         else:
             if not self.quiet:
@@ -457,7 +456,7 @@ class DigitalPaper:
         else:
             field_query = ""
         entry_data = self._get_endpoint(
-            f"/documents2?entry_type=all" + field_query
+            "/documents2?entry_type=all" + field_query
         ).json()
 
         if entry_data.get("count") != len(entry_data.get("entry_list", [])):
@@ -467,13 +466,13 @@ class DigitalPaper:
             # but we do not know how. Let's fall back to the slower recursive traversal
             print("Warning: Fast folder traversal did not work. Falling back to slower, recursive folder traversal.")
             return self.traverse_folder_recursively(remote_path)
-        
+
         all_entries = entry_data["entry_list"]
 
         return list(
             filter(lambda e: e["entry_path"].startswith(remote_path), all_entries)
         )
-    
+
     def traverse_folder_recursively(self, remote_path):
         # Fallback when the device has >~1300 items and the fast single-request path truncates.
         # Uses parallel BFS: all folders at the same depth level are fetched concurrently,
@@ -536,11 +535,11 @@ class DigitalPaper:
     def delete_document(self, remote_path):
         try:
             remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             # Path not found
             return
         self.delete_document_by_id(remote_id)
-    
+
     def delete_template(self,template_name):
         template_list = self.list_templates()
         for t in template_list:
@@ -550,12 +549,12 @@ class DigitalPaper:
 
     def display_document(self, document_id, page=1):
         info = {"document_id": document_id, "page": page}
-        r = self._put_endpoint("/viewer/controls/open2", data=info)
+        self._put_endpoint("/viewer/controls/open2", data=info)
 
     def delete_folder(self, remote_path):
         try:
             remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             # Path not found
             return
         self.delete_folder_by_id(remote_id)
@@ -565,7 +564,7 @@ class DigitalPaper:
 
     def delete_folder_by_id(self, folder_id):
         self._delete_endpoint(f"/folders/{folder_id}")
-    
+
     def delete_template_by_id(self, template_id):
         self._delete_endpoint(f"/viewer/configs/note_templates/{template_id}")
 
@@ -578,7 +577,7 @@ class DigitalPaper:
         r = self._post_endpoint("/viewer/configs/note_templates", data=info)
         doc = r.json()
         doc_url = "/viewer/configs/note_templates/{}/file".format(doc["note_template_id"])
-        
+
         files = { 'file': (quote_plus(filename), fh, 'rb') }
         self._put_endpoint(doc_url, files=files)
 
@@ -588,7 +587,7 @@ class DigitalPaper:
         try:
             # If there exists a document in the specified remote path, overwrite it.
             doc_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             remote_directory = os.path.dirname(remote_path)
             self.new_folder(remote_directory)
             directory_id = self._get_object_id(remote_directory)
@@ -611,22 +610,22 @@ class DigitalPaper:
         remote_path = remote_path.rstrip('/')
         if not remote_path or remote_path == '/':
             return  # Don't try to create root directory
-            
+
         folder_name = os.path.basename(remote_path)
         remote_directory = os.path.dirname(remote_path)
-        
+
         # Prevent infinite recursion - stop at root or empty directory
         if not remote_directory or remote_directory == '/' or remote_directory == remote_path:
             return
-            
+
         # Check if the parent directory exists, and create it if needed
         if not self.path_exists(remote_directory):
             self.new_folder(remote_directory)
-            
+
         directory_id = self._get_object_id(remote_directory)
         info = {"folder_name": folder_name, "parent_folder_id": directory_id}
 
-        r = self._post_endpoint("/folders2", data=info)
+        self._post_endpoint("/folders2", data=info)
 
     def list_folders(self):
         if not self.folder_list:
@@ -670,8 +669,8 @@ class DigitalPaper:
 
     def path_exists(self, remote_path):
         try:
-            remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+            self._get_object_id(remote_path)
+        except ResolveObjectFailed:
             return False
         return True
 
@@ -958,7 +957,7 @@ class DigitalPaper:
             print("")
             confirm = ""
             while not (confirm in ("y", "yes") or self.assume_yes):
-                confirm = input(f"Proceed (y/n/?/ig)? ")
+                confirm = input("Proceed (y/n/?/ig)? ")
                 if confirm in ("n", "no"):
                     return
                 if confirm in ("?", "list", "l"):
@@ -1285,22 +1284,22 @@ class DigitalPaper:
         patterns = self.load_ignore_patterns(local_folder)
         if not patterns:
             return []
-        
+
         ignored_files = []
         visited_paths = set()  # Track visited directories to prevent infinite recursion
-        
+
         def traverse_for_ignored(path, depth=0):
             # Prevent infinite recursion due to circular symlinks or deep nesting
             if depth > _MAX_LOCAL_TRAVERSAL_DEPTH:
                 return
-                
+
             try:
                 # Get the real path to handle symlinks
                 real_path = os.path.realpath(path)
                 if real_path in visited_paths:
                     return  # Already visited this directory
                 visited_paths.add(real_path)
-                
+
                 for entry in os.scandir(path):
                     if entry.is_dir():
                         traverse_for_ignored(entry.path, depth + 1)
@@ -1311,7 +1310,7 @@ class DigitalPaper:
             except (OSError, ValueError):
                 # Skip directories that can't be accessed or processed
                 pass
-        
+
         traverse_for_ignored(local_folder)
         return ignored_files
 
@@ -1458,14 +1457,14 @@ class DigitalPaper:
         Input uses the same format that get_config() returns.
         """
         for key, setting in config.items():
-            data = self._put_endpoint("/system/configs/" + key, data=setting)
+            self._put_endpoint("/system/configs/" + key, data=setting)
 
     def get_timeout(self):
         data = self._get_endpoint("/system/configs/timeout_to_standby").json()
         return data["value"]
 
     def set_timeout(self, value):
-        data = self._put_endpoint(
+        self._put_endpoint(
             "/system/configs/timeout_to_standby", data={"value": value}
         )
 
@@ -1474,28 +1473,28 @@ class DigitalPaper:
         return data["value"]
 
     def set_date_format(self, value):
-        data = self._put_endpoint("/system/configs/date_format", data={"value": value})
+        self._put_endpoint("/system/configs/date_format", data={"value": value})
 
     def get_time_format(self):
         data = self._get_endpoint("/system/configs/time_format").json()
         return data["value"]
 
     def set_time_format(self, value):
-        data = self._put_endpoint("/system/configs/time_format", data={"value": value})
+        self._put_endpoint("/system/configs/time_format", data={"value": value})
 
     def get_timezone(self):
         data = self._get_endpoint("/system/configs/timezone").json()
         return data["value"]
 
     def set_timezone(self, value):
-        data = self._put_endpoint("/system/configs/timezone", data={"value": value})
+        self._put_endpoint("/system/configs/timezone", data={"value": value})
 
     def get_owner(self):
         data = self._get_endpoint("/system/configs/owner").json()
         return data["value"]
 
     def set_owner(self, value):
-        data = self._put_endpoint("/system/configs/owner", data={"value": value})
+        self._put_endpoint("/system/configs/owner", data={"value": value})
 
     ### System info
 
@@ -1548,7 +1547,7 @@ class DigitalPaper:
 
     def update_firmware(self, fwfh):
         filename = "FwUpdater.pkg"
-        fw_url = "/system/controls/update_firmware/file".format(base_url=self.base_url)
+        fw_url = "/system/controls/update_firmware/file".format()
         files = {"file": (quote_plus(filename), fwfh, "rb")}
         # TODO: add file transferring feedback
         self._put_endpoint(fw_url, files=files)
@@ -1630,8 +1629,8 @@ def pad(bytestring, k=16):
     Pad an input bytestring according to PKCS#7
 
     """
-    l = len(bytestring)
-    val = k - (l % k)
+    length = len(bytestring)
+    val = k - (length % k)
     return bytestring + bytearray([val] * val)
 
 
@@ -1662,5 +1661,5 @@ def unpad(bytestring, k=16):
     val = bytestring[-1]
     if val > k:
         raise ValueError("Input is not padded or padding is corrupt")
-    l = len(bytestring) - val
-    return bytestring[:l]
+    length = len(bytestring) - val
+    return bytestring[:length]

@@ -4,12 +4,11 @@
 import argparse
 import inspect
 import json
-import sys
 import os
 import re
+import sys
 import traceback
 
-from pathlib import Path
 from dptrp1.dptrp1 import DigitalPaper, find_auth_files, get_default_auth_files
 
 ROOT_FOLDER = 'Document'
@@ -107,7 +106,7 @@ def do_display_document(d, remote_path, page=1):
     To display a local document, upload it first.
     Optionally pass a page number to open a specific page, number 1 being the front page.
     Will show the first page if the page parameter is omitted.
-    
+
     Example: dptrp1 display-document Document/Magazines/Comic.pdf 5
     """
     info = d.list_document_info(add_prefix(remote_path))
@@ -171,7 +170,7 @@ def do_add_ignore(d, local_path, pattern):
 def do_remove_ignore(d, local_path, pattern):
     """
     Remove a file pattern from the sync ignore list for the given local folder.
-    
+
     Example: dptrp1 remove-ignore ~/Dropbox/Papers "*.tmp"
     """
     if d.remove_ignore_pattern(local_path, pattern):
@@ -183,7 +182,7 @@ def do_remove_ignore(d, local_path, pattern):
 def do_list_ignore(d, local_path):
     """
     List all ignore patterns for the given local folder.
-    
+
     Example: dptrp1 list-ignore ~/Dropbox/Papers
     """
     patterns = d.load_ignore_patterns(local_path)
@@ -307,7 +306,7 @@ def do_help(command):
         args = [format_parameter(x) for x in args[1:]]
         print()
         print("    Usage:", sys.argv[0], command, *args)
-    except:
+    except Exception:
         pass
     print(commands[command].__doc__)
 
