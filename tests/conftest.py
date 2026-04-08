@@ -1,6 +1,20 @@
 """Shared pytest fixtures for dpt-rp1-py tests."""
+import sys
+import types
 import pytest
 from unittest.mock import MagicMock
+
+# httpsig uses pkg_resources only to read its own version number.
+# Stub it out if setuptools isn't installed (common on CI).
+if "pkg_resources" not in sys.modules:
+    try:
+        import pkg_resources  # noqa: F401
+    except ImportError:
+        _stub = types.ModuleType("pkg_resources")
+        _stub.get_distribution = MagicMock(return_value=MagicMock(version="unknown"))
+        _stub.DistributionNotFound = Exception
+        sys.modules["pkg_resources"] = _stub
+
 from dptrp1.dptrp1 import DigitalPaper
 
 
