@@ -80,7 +80,7 @@ class _IPv6ScopeAdapter(requests.adapters.HTTPAdapter):
 
 def get_default_auth_files():
     """Get the default path where the authentication files for connecting to DPT-RP1 are stored"""
-    config_path = os.path.join(os.path.expanduser("~"), ".dpapp")
+    config_path = os.path.join(os.path.expanduser("~"), ".config", "dpt")
     os.makedirs(config_path, exist_ok=True)
     deviceid = os.path.join(config_path, "deviceid.dat")
     privatekey = os.path.join(config_path, "privatekey.dat")
@@ -252,19 +252,18 @@ class DigitalPaper:
             - client_id: the client id
         """
 
-        reg_url = "http://{addr}:8080".format(addr=self.addr)
-        register_pin_url = "{base_url}/register/pin".format(base_url=reg_url)
-        register_hash_url = "{base_url}/register/hash".format(base_url=reg_url)
-        register_ca_url = "{base_url}/register/ca".format(base_url=reg_url)
-        register_url = "{base_url}/register".format(base_url=reg_url)
-        register_cleanup_url = "{base_url}/register/cleanup".format(base_url=reg_url)
+        register_pin_url = "/register/pin"
+        register_hash_url = "/register/hash"
+        register_ca_url = "/register/ca"
+        register_url = "/register"
+        register_cleanup_url = "/register/cleanup"
 
         print("Cleaning up...")
-        r = self.session.put(register_cleanup_url)
+        r = self._reg_endpoint_request("PUT", register_cleanup_url)
         print(r)
 
         print("Requesting PIN...")
-        r = self.session.post(register_pin_url)
+        r = self._reg_endpoint_request("POST", register_pin_url)
         m1 = r.json()
 
         n1 = base64.b64decode(m1["a"])
@@ -301,7 +300,7 @@ class DigitalPaper:
         )
 
         print("Encoding nonce...")
-        r = self.session.post(register_hash_url, json=m2)
+        r = self._reg_endpoint_request("POST", register_hash_url, data=m2)
         m3 = r.json()
 
         if base64.b64decode(m3.get("a", "")) != n2:
@@ -341,7 +340,7 @@ class DigitalPaper:
         )
 
         print("Getting certificate from device CA...")
-        r = self.session.post(register_ca_url, json=m4)
+        r = self._reg_endpoint_request("POST", register_ca_url, data=m4)
         print(r)
 
         m5 = r.json()
@@ -400,11 +399,11 @@ class DigitalPaper:
         )
 
         print("Registering device...")
-        r = self.session.post(register_url, json=m6)
+        r = self._reg_endpoint_request("POST", register_url, data=m6)
         print(r)
 
         print("Cleaning up...")
-        r = self.session.put(register_cleanup_url)
+        r = self._reg_endpoint_request("PUT", register_cleanup_url)
         print(r)
 
         return (
@@ -422,9 +421,8 @@ class DigitalPaper:
         signed_nonce = base64.b64encode(
             pkcs1_15.new(RSA.import_key(key)).sign(h)
         ).decode("ascii")
-        url = "{base_url}/auth".format(base_url=self.base_url)
         data = {"client_id": client_id, "nonce_signed": signed_nonce}
-        r = self.session.put(url, json=data)
+        r = self._put_endpoint("/auth", data=data)
         # cookiejar cannot parse the cookie format used by the tablet,
         # so we have to set it manually.
         _, credentials = r.headers["Set-Cookie"].split("; ")[0].split("=")
@@ -688,9 +686,7 @@ class DigitalPaper:
             self.set_datetime()
             self.new_folder(remote_folder)
             print("Looking for changes on device... ", end="", flush=True)
-            remote_info = self.traverse_folder(
-                remote_folder, fields=["entry_path", "modified_date", "entry_type"]
-            )
+            remote_info = self.traverse_folder_recursively(remote_folder)
             print("done")
 
             # Syncing will require different comparions between local and remote paths.
@@ -1146,9 +1142,7 @@ class DigitalPaper:
                 progress_bar.close()
 
             print("Refreshing file information... ", end="", flush=True)
-            remote_info = self.traverse_folder(
-                remote_folder, fields=["entry_path", "modified_date", "entry_type"]
-            )
+            remote_info = self.traverse_folder_recursively(remote_folder)
             self.sync_checkpoint(local_folder, remote_info)
             print("done")
 
@@ -1579,9 +1573,19 @@ class DigitalPaper:
             self._put_endpoint("/system/controls/update_firmware")
 
     ### Utility
+    def _reg_endpoint_request(self, method, endpoint, data=None, files=None):
+        """Make a request to the HTTP (port 8080) registration endpoint, preventing URL-escaping of '%'."""
+        base_url = "http://{addr}:8080".format(addr=self.addr)
+        req = requests.Request(method, base_url, json=data, files=files)
+        prep = self.session.prepare_request(req)
+        prep.url = prep.url.replace("%25", "%")
+        prep.url += endpoint.lstrip("/")
+        return self.session.send(prep)
+
     def _endpoint_request(self, method, endpoint, data=None, files=None):
         req = requests.Request(method, self.base_url, json=data, files=files)
         prep = self.session.prepare_request(req)
+        prep.url = prep.url.replace("%25", "%")
         # modifying the prepared request, so that the "endpoint" part of
         # the URL will not be modified by urllib.
         prep.url += endpoint.lstrip("/")
