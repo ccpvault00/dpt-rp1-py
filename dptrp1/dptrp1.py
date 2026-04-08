@@ -1,30 +1,81 @@
 #!/usr/bin/env python3
-import os
-import sys
-import uuid
-import time
 import base64
-import httpsig
-import urllib3
-import requests
-import functools
-import unicodedata
+import errno
+import fnmatch
+import logging
+import os
 import pickle
-import shutil
-from tqdm import tqdm
-from glob import glob
-from urllib.parse import quote_plus
-from dptrp1.pyDH import DiffieHellman
+import socket
+import sys
+import threading
+import time
+import unicodedata
+import uuid
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pbkdf2 import PBKDF2
+from glob import glob
+from pathlib import Path
+from urllib.parse import quote_plus
+
+import httpsig
+import requests
+import urllib3
+import urllib3.util.connection as _urllib3_conn
+from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 from Crypto.Hash.HMAC import HMAC
-from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
-from pathlib import Path
-from collections import defaultdict
+from pbkdf2 import PBKDF2
+from tqdm import tqdm
+
+from dptrp1.pyDH import DiffieHellman
+
+_MAX_LOCAL_TRAVERSAL_DEPTH = 100
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Thread-safe IPv6 link-local scope ID support for urllib3 2.x.
+# Patched once at import time; each adapter instance sets a thread-local
+# scope_id before calling super().send() so concurrent threads don't race
+# on a shared global.
+_ipv6_tls = threading.local()
+
+if not getattr(_urllib3_conn, "_scoped_patched", False):
+    _orig_create_connection = _urllib3_conn.create_connection
+
+    def _scoped_create_connection(address, *a, **kw):
+        scope_id = getattr(_ipv6_tls, "scope_id", None)
+        if scope_id is not None:
+            host, port = address
+            host = host.strip("[]")
+            timeout = kw.get("timeout")
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                if timeout not in (None, socket.getdefaulttimeout()):
+                    sock.settimeout(timeout)
+                sock.connect((host, port, 0, scope_id))
+                return sock
+            except Exception:
+                sock.close()
+                raise
+        return _orig_create_connection(address, *a, **kw)
+
+    _urllib3_conn.create_connection = _scoped_create_connection
+    _urllib3_conn._scoped_patched = True
+
+
+class _IPv6ScopeAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, scope_id, pool_maxsize=32):
+        super().__init__(pool_maxsize=pool_maxsize)
+        self._scope_id = scope_id
+
+    def send(self, request, *args, **kwargs):
+        _ipv6_tls.scope_id = self._scope_id
+        try:
+            return super().send(request, *args, **kwargs)
+        finally:
+            _ipv6_tls.scope_id = None
 
 
 def get_default_auth_files():
@@ -130,7 +181,7 @@ class LookUpDPT:
         wait = self.lock.acquire(timeout=timeout) or (self.addr is not None)
         zc.close()
         if not wait:
-            print("Failed".format(timeout))
+            print("Failed")
             return None
         else:
             if not self.quiet:
@@ -162,7 +213,21 @@ class DigitalPaper:
 
         self.session = requests.Session()
         self.session.verify = False  # disable ssl certificate verification
+        self.session.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=32))
         self.assume_yes = assume_yes  # Whether to disable interactive prompts (currently only in sync())
+        self.folder_list = []
+
+        # urllib3 2.x cannot handle IPv6 link-local addresses with zone IDs (e.g.
+        # fe80::1%eth0) in URLs. If the address contains a '%', extract the zone ID,
+        # rewrite self.addr to the bare IPv6 form for URL construction, and mount a
+        # custom HTTPAdapter that passes the scope_id directly to the socket via the
+        # 4-tuple (host, port, flowinfo, scope_id) form required by the kernel.
+        raw = self.addr.strip("[]")
+        if "%" in raw:
+            ipv6_addr, iface = raw.split("%", 1)
+            self.addr = "[{}]".format(ipv6_addr)
+            scope_id = socket.if_nametoindex(iface)
+            self.session.mount("https://", _IPv6ScopeAdapter(scope_id, pool_maxsize=32))
 
     @property
     def base_url(self):
@@ -391,7 +456,7 @@ class DigitalPaper:
         else:
             field_query = ""
         entry_data = self._get_endpoint(
-            f"/documents2?entry_type=all" + field_query
+            "/documents2?entry_type=all" + field_query
         ).json()
 
         if entry_data.get("count") != len(entry_data.get("entry_list", [])):
@@ -401,27 +466,57 @@ class DigitalPaper:
             # but we do not know how. Let's fall back to the slower recursive traversal
             print("Warning: Fast folder traversal did not work. Falling back to slower, recursive folder traversal.")
             return self.traverse_folder_recursively(remote_path)
-        
+
         all_entries = entry_data["entry_list"]
 
         return list(
             filter(lambda e: e["entry_path"].startswith(remote_path), all_entries)
         )
-    
+
     def traverse_folder_recursively(self, remote_path):
-        # This is the old recursive implementation of traverse_folder.
-        # It is slower because the main overhead when communicating with the DPT-RP1 is the request latency,
-        # and this recursive implementation makes one request per folder. However, the faster implementation
-        # above fails when there are more than 1300 items, in which case we fall back to this older implementation
-        def traverse(obj):
-            if obj['entry_type'] == 'document':
-                return [obj]
-            else:
-                children = self \
-                  ._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = obj['entry_id'])) \
-                  .json()['entry_list']
-                return [obj] + functools.reduce(lambda acc, c: traverse(c) + acc, children[::-1], [])
-        return traverse(self._resolve_object_by_path(remote_path))
+        # Fallback when the device has >~1300 items and the fast single-request path truncates.
+        # Uses parallel BFS: all folders at the same depth level are fetched concurrently,
+        # reducing scan time from O(N_folders * latency) to O(depth * latency).
+        #
+        # Thread-safety note: `visited_folders` and `all_entries` are mutated ONLY in the
+        # single-threaded main loop between BFS levels (after all futures for a level complete).
+        # Worker threads only read `folder_obj` arguments and return new lists — no shared
+        # mutation inside workers. This BFS level-isolation is what makes it safe.
+        _logger = logging.getLogger(__name__)
+        visited_folders = set()
+        all_entries = []
+
+        def fetch_children(folder_obj):
+            folder_id = folder_obj.get('entry_id')
+            try:
+                resp = self._get_endpoint(
+                    "/folders/{remote_id}/entries2".format(remote_id=folder_id)
+                )
+                resp.raise_for_status()
+                return resp.json().get('entry_list', [])
+            except requests.RequestException as exc:
+                _logger.warning("Failed to list folder %s: %s", folder_id, exc)
+                return []
+
+        root = self._resolve_object_by_path(remote_path)
+        all_entries.append(root)
+        pending_folders = [root] if root['entry_type'] == 'folder' else []
+        visited_folders.add(root.get('entry_id'))
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            while pending_folders:
+                futures = {executor.submit(fetch_children, f): f for f in pending_folders}
+                next_pending = []
+                for future in as_completed(futures):
+                    for child in future.result():
+                        all_entries.append(child)
+                        child_id = child.get('entry_id')
+                        if child['entry_type'] == 'folder' and child_id not in visited_folders:
+                            visited_folders.add(child_id)
+                            next_pending.append(child)
+                pending_folders = next_pending
+
+        return all_entries
 
 
     def list_document_info(self, remote_path):
@@ -440,11 +535,11 @@ class DigitalPaper:
     def delete_document(self, remote_path):
         try:
             remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             # Path not found
             return
         self.delete_document_by_id(remote_id)
-    
+
     def delete_template(self,template_name):
         template_list = self.list_templates()
         for t in template_list:
@@ -454,12 +549,12 @@ class DigitalPaper:
 
     def display_document(self, document_id, page=1):
         info = {"document_id": document_id, "page": page}
-        r = self._put_endpoint("/viewer/controls/open2", data=info)
+        self._put_endpoint("/viewer/controls/open2", data=info)
 
     def delete_folder(self, remote_path):
         try:
             remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             # Path not found
             return
         self.delete_folder_by_id(remote_id)
@@ -469,7 +564,7 @@ class DigitalPaper:
 
     def delete_folder_by_id(self, folder_id):
         self._delete_endpoint(f"/folders/{folder_id}")
-    
+
     def delete_template_by_id(self, template_id):
         self._delete_endpoint(f"/viewer/configs/note_templates/{template_id}")
 
@@ -482,7 +577,7 @@ class DigitalPaper:
         r = self._post_endpoint("/viewer/configs/note_templates", data=info)
         doc = r.json()
         doc_url = "/viewer/configs/note_templates/{}/file".format(doc["note_template_id"])
-        
+
         files = { 'file': (quote_plus(filename), fh, 'rb') }
         self._put_endpoint(doc_url, files=files)
 
@@ -492,7 +587,7 @@ class DigitalPaper:
         try:
             # If there exists a document in the specified remote path, overwrite it.
             doc_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+        except ResolveObjectFailed:
             remote_directory = os.path.dirname(remote_path)
             self.new_folder(remote_directory)
             directory_id = self._get_object_id(remote_directory)
@@ -511,16 +606,26 @@ class DigitalPaper:
         self._put_endpoint(doc_url, files=files)
 
     def new_folder(self, remote_path):
+        # Normalize path and remove trailing slashes
+        remote_path = remote_path.rstrip('/')
+        if not remote_path or remote_path == '/':
+            return  # Don't try to create root directory
+
         folder_name = os.path.basename(remote_path)
         remote_directory = os.path.dirname(remote_path)
-        if not remote_directory:
+
+        # Prevent infinite recursion - stop at root or empty directory
+        if not remote_directory or remote_directory == '/' or remote_directory == remote_path:
             return
+
+        # Check if the parent directory exists, and create it if needed
         if not self.path_exists(remote_directory):
             self.new_folder(remote_directory)
+
         directory_id = self._get_object_id(remote_directory)
         info = {"folder_name": folder_name, "parent_folder_id": directory_id}
 
-        r = self._post_endpoint("/folders2", data=info)
+        self._post_endpoint("/folders2", data=info)
 
     def list_folders(self):
         if not self.folder_list:
@@ -564,350 +669,483 @@ class DigitalPaper:
 
     def path_exists(self, remote_path):
         try:
-            remote_id = self._get_object_id(remote_path)
-        except ResolveObjectFailed as e:
+            self._get_object_id(remote_path)
+        except ResolveObjectFailed:
             return False
         return True
 
-    def sync(self, local_folder, remote_folder):
-        checkpoint_info = self.load_checkpoint(local_folder)
-        self.set_datetime()
-        self.new_folder(remote_folder)
-        print("Looking for changes on device... ", end="", flush=True)
-        remote_info = self.traverse_folder(
-            remote_folder, fields=["entry_path", "modified_date", "entry_type"]
-        )
-        print("done")
-
-        # Syncing will require different comparions between local and remote paths.
-        # Let's normalize them to ensure stable comparisions,
-        # both with respect to unicode normalization and with respect to
-        # directory separator symbols.
-        def normalize_path(path):
-            return unicodedata.normalize("NFC", path).replace(os.sep, "/")
-
-        # Create a defaultdict of defaultdict
-        # so that we can save data to it with two indexes, without having to manually create
-        # nested dictionaries.
-        # Will contain:
-        # file_data[<filename>][<checkpoint/remote/local>_time] = <timestamp>
-        file_data = defaultdict(lambda: defaultdict(lambda: None))
-
-        # When it comes to folders, we want to handle them separately and not care about creation/deletion.
-        # We therefore use a slightly different data structure:
-        # folder_data[<filename>][checkpoint/remote/local_exists] = True/False
-        folder_data = defaultdict(lambda: defaultdict(lambda: False))
-
-        # Then we will go changes locally, remotely, and in checkpoint, and save all modificaiton times to the same
-        # data structure for easy comparison, and the same with folders.
-
-        # The checkpoint and remote_info contain the same data-structure, because the checkpoint is simply a dump of
-        # remote_info at a previous point in time. Therefore, we use the same code to look through both of them:
-        for location_info, location in [
-            (checkpoint_info, "checkpoint"),
-            (remote_info, "remote"),
-        ]:
-            for f in location_info:
-                path = normalize_path(f["entry_path"])
-                if path.startswith(remote_folder):
-                    if f["entry_type"] == "document":
-                        modification_time = datetime.strptime(
-                            f["modified_date"], "%Y-%m-%dT%H:%M:%SZ"
-                        )
-                        file_data[path][f"{location}_time"] = modification_time
-                    elif f["entry_type"] == "folder":
-                        folder_data[path][f"{location}_exists"] = True
-
-        print("Looking for local changes... ", end="", flush=True)
-        # Recursively traverse the local path looking for PDF files.
-        # Use relatively low-level os.scandir()-api instead of a higher-level api such as glob.glob()
-        # because os.scandir() gives access to mtime without having to perform an additional syscall on Windows,
-        # leading to much faster scanning times on Windows
-        def traverse_local_folder(path):
-            # Let's store to folder_data that this folder exists
-            relative_path = Path(path).relative_to(local_folder)
-            remote_path = normalize_path(
-                (Path(remote_folder) / relative_path).as_posix()
+    def sync(self, local_folder, remote_folder, workers=4):
+        should_restart = True
+        while should_restart:
+            should_restart = False
+            checkpoint_info = self.load_checkpoint(local_folder)
+            ignore_patterns = self.load_ignore_patterns(local_folder)
+            self.set_datetime()
+            self.new_folder(remote_folder)
+            print("Looking for changes on device... ", end="", flush=True)
+            remote_info = self.traverse_folder(
+                remote_folder, fields=["entry_path", "modified_date", "entry_type"]
             )
-            folder_data[remote_path]["local_exists"] = True
-            # And recursively go through all items inside of the folder
-            for entry in os.scandir(path):
-                if entry.is_dir():
-                    traverse_local_folder(entry.path)
-                # Only handle PDF files, ignore files starting with a dot.
-                elif entry.name.lower().endswith(".pdf") and not entry.name.startswith(
-                    "."
-                ):
-                    relative_path = Path(entry.path).relative_to(local_folder)
+            print("done")
+
+            # Syncing will require different comparions between local and remote paths.
+            # Let's normalize them to ensure stable comparisions,
+            # both with respect to unicode normalization and with respect to
+            # directory separator symbols.
+            def normalize_path(path):
+                return unicodedata.normalize("NFC", path).replace(os.sep, "/")
+
+            # Create a defaultdict of defaultdict
+            # so that we can save data to it with two indexes, without having to manually create
+            # nested dictionaries.
+            # Will contain:
+            # file_data[<filename>][<checkpoint/remote/local>_time] = <timestamp>
+            file_data = defaultdict(lambda: defaultdict(lambda: None))
+
+            # When it comes to folders, we want to handle them separately and not care about creation/deletion.
+            # We therefore use a slightly different data structure:
+            # folder_data[<filename>][checkpoint/remote/local_exists] = True/False
+            folder_data = defaultdict(lambda: defaultdict(lambda: False))
+
+            # Then we will go changes locally, remotely, and in checkpoint, and save all modificaiton times to the same
+            # data structure for easy comparison, and the same with folders.
+
+            # The checkpoint and remote_info contain the same data-structure, because the checkpoint is simply a dump of
+            # remote_info at a previous point in time. Therefore, we use the same code to look through both of them:
+            for location_info, location in [
+                (checkpoint_info, "checkpoint"),
+                (remote_info, "remote"),
+            ]:
+                for f in location_info:
+                    path = normalize_path(f["entry_path"])
+                    if path.startswith(remote_folder):
+                        if f["entry_type"] == "document":
+                            modification_time = datetime.strptime(
+                                f["modified_date"], "%Y-%m-%dT%H:%M:%SZ"
+                            )
+                            file_data[path][f"{location}_time"] = modification_time
+
+                            # Mark if this file is ignored (but still track it)
+                            if location == "remote":
+                                relative_path = str(Path(path).relative_to(remote_folder))
+                                if self.is_ignored(relative_path, ignore_patterns):
+                                    file_data[path]["ignored"] = True
+
+                        elif f["entry_type"] == "folder":
+                            folder_data[path][f"{location}_exists"] = True
+
+            print("Looking for local changes... ", end="", flush=True)
+            # Recursively traverse the local path looking for PDF files.
+            # Use relatively low-level os.scandir()-api instead of a higher-level api such as glob.glob()
+            # because os.scandir() gives access to mtime without having to perform an additional syscall on Windows,
+            # leading to much faster scanning times on Windows
+
+            # Track ignored files count during traversal instead of re-scanning
+            ignored_count = 0
+            visited_paths = set()  # Track visited directories to prevent infinite recursion
+
+            def traverse_local_folder(path, depth=0):
+                nonlocal ignored_count
+                # Prevent infinite recursion due to circular symlinks or deep nesting
+                if depth > _MAX_LOCAL_TRAVERSAL_DEPTH:
+                    return
+
+                try:
+                    # Get the real path to handle symlinks
+                    real_path = os.path.realpath(path)
+                    if real_path in visited_paths:
+                        return  # Already visited this directory
+                    visited_paths.add(real_path)
+
+                    # Let's store to folder_data that this folder exists
+                    relative_path = Path(path).relative_to(local_folder)
                     remote_path = normalize_path(
                         (Path(remote_folder) / relative_path).as_posix()
                     )
-                    modification_time = datetime.utcfromtimestamp(entry.stat().st_mtime)
-                    file_data[remote_path]["local_time"] = modification_time
+                    folder_data[remote_path]["local_exists"] = True
+                    # And recursively go through all items inside of the folder
+                    for entry in os.scandir(path):
+                        if entry.is_dir():
+                            traverse_local_folder(entry.path, depth + 1)
+                        # Only handle PDF files, ignore files starting with a dot.
+                        elif entry.name.lower().endswith(".pdf") and not entry.name.startswith(
+                            "."
+                        ):
+                            relative_path = Path(entry.path).relative_to(local_folder)
+                            remote_path = normalize_path(
+                                (Path(remote_folder) / relative_path).as_posix()
+                            )
+                            modification_time = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+                            file_data[remote_path]["local_time"] = modification_time
 
-        traverse_local_folder(local_folder)
-        print("done")
+                            # Mark if this file is ignored (but still track it)
+                            if self.is_ignored(str(relative_path), ignore_patterns):
+                                file_data[remote_path]["ignored"] = True
+                                ignored_count += 1
+                except (OSError, ValueError):
+                    # Skip directories that can't be accessed or processed
+                    pass
 
-        # Let's loop through the data structure
-        # to create list of actions to take
-        to_download = []
-        to_delete_local = []
-        to_upload = []
-        to_delete_remote = []
+            traverse_local_folder(local_folder)
 
-        missing_checkpoint_files = []
+            # Show ignored files count
+            if ignored_count > 0:
+                print(f"Found {ignored_count} ignored files (use list-ignored-files to see them)")
 
-        for filename, data in file_data.items():
-            if data["checkpoint_time"] is None:
-                if data["remote_time"] and data["local_time"]:
-                    # File exists both on device and locally, but not in checkpoint.
-                    # Corrupt or missing checkpoint?
-                    # The safest bet is to assume that the two files are identical, and not sync in either directions.
-                    missing_checkpoint_files.append(filename)
+            print("done")
+
+            # Let's loop through the data structure
+            # to create list of actions to take
+            to_download = []
+            to_delete_local = []
+            to_upload = []
+            to_delete_remote = []
+
+            missing_checkpoint_files = []
+
+            for filename, data in file_data.items():
+                # Skip ignored files completely from sync decisions
+                if data.get("ignored", False):
                     continue
 
-                if data["remote_time"]:
-                    # File only exists on remote, so it's new and should be downloaded
-                    to_download.append(filename)
-                    continue
-                if data["local_time"]:
-                    # File only exists locally, sot it's new and should be uploaded
-                    to_upload.append(filename)
-                    continue
+                if data["checkpoint_time"] is None:
+                    if data["remote_time"] and data["local_time"]:
+                        # File exists both on device and locally, but not in checkpoint.
+                        # Corrupt or missing checkpoint?
+                        # The safest bet is to assume that the two files are identical, and not sync in either directions.
+                        missing_checkpoint_files.append(filename)
+                        continue
 
-            # If we get to here, file exists in checkpoint
-            modified_local = (
-                data["local_time"] and data["local_time"] > data["checkpoint_time"]
-            )
-            modified_remote = (
-                data["remote_time"] and data["remote_time"] > data["checkpoint_time"]
-            )
-            deleted_local = data["local_time"] is None
-            deleted_remote = data["remote_time"] is None
+                    if data["remote_time"]:
+                        # File only exists on remote, so it's new and should be downloaded
+                        to_download.append(filename)
+                        continue
+                    if data["local_time"]:
+                        # File only exists locally, sot it's new and should be uploaded
+                        to_upload.append(filename)
+                        continue
 
-            if modified_local and modified_remote:
-                print(
-                    f"Warning, sync conflict!  {filename} is changed both locally and remotely."
+                # If we get to here, file exists in checkpoint
+                modified_local = (
+                    data["local_time"] and data["local_time"] > data["checkpoint_time"]
                 )
-                if data["local_time"] > data["remote_time"]:
-                    print("Local change is newer and will take precedence.")
-                    to_upload.append(filename)
-                else:
-                    print("Remote change is newer and will take precedence.")
-                    to_download.append(filename)
-            elif modified_local:
-                to_upload.append(filename)
-            elif modified_remote:
-                to_download.append(filename)
-            elif deleted_local:
-                to_delete_remote.append(filename)
-            elif deleted_remote:
-                to_delete_local.append(filename)
-
-        if missing_checkpoint_files:
-            print(
-                "\nWarning: The following files exist both locally and on the DPT, but do not seem to have been synchronized using this tool:"
-            )
-
-            max_print = 20  # Let's only print the first max_print filenames to avoid completely flooding
-            # stdout with unusable information if missing metadata means that this happens
-            # to all files in the user's library
-            print("\t" + "\n\t".join(missing_checkpoint_files[:max_print]))
-            if len(missing_checkpoint_files) > max_print:
-                print(
-                    f"\t... and {len(missing_checkpoint_files)-max_print} additional files"
+                modified_remote = (
+                    data["remote_time"] and data["remote_time"] > data["checkpoint_time"]
                 )
-            print("The files will be assumed to be identical.\n")
+                deleted_local = data["local_time"] is None
+                deleted_remote = data["remote_time"] is None
 
-        # Just syncing the files will automatically create the necessary folders to store the given files, but it won't sync empty folders,
-        # or folder deletion. Therefore, let's go through the folder_data as well, to see which additional folder operations need to be performed:
-        folders_to_delete_remote = []
-        folders_to_delete_local = []
-        folders_to_create_remote = []
-        folders_to_create_local = []
-        for foldername, data in folder_data.items():
-            # data contains information about whether the given foldername exists locally, remotely, and in the checkpoint.
-            # In addition, we plan to upload/download some files, in which case we won't need to manually create the folders.
-            # So let's updte data to describe the expected situation after uploading/downloding those files, to decide which additional
-            # folder operations need to be performed.
-            data["remote_exists"] = data["remote_exists"] or any(
-                [f.startswith(foldername) for f in to_upload]
-            )
-            data["local_exists"] = data["local_exists"] or any(
-                [f.startswith(foldername) for f in to_download]
-            )
-
-            # Depending on whether the folder exists is remote/local/checkpoint, let's decide whether to create/delete the folder from remote/local.
-            create_remote = (
-                data["local_exists"]
-                and (not data["checkpoint_exists"])
-                and (not data["remote_exists"])
-            )
-            create_local = (
-                data["remote_exists"]
-                and (not data["checkpoint_exists"])
-                and (not data["local_exists"])
-            )
-            delete_remote = (
-                (not data["local_exists"])
-                and data["checkpoint_exists"]
-                and data["remote_exists"]
-            )
-            delete_local = (
-                (not data["remote_exists"])
-                and data["checkpoint_exists"]
-                and data["local_exists"]
-            )
-
-            if create_remote:
-                folders_to_create_remote.append(foldername)
-            if create_local:
-                folders_to_create_local.append(foldername)
-            if delete_remote:
-                folders_to_delete_remote.append(foldername)
-            if delete_local:
-                folders_to_delete_local.append(foldername)
-
-        # If a folder structure is deleted, let's sort the deletion so that we always select the innermost, empty, folder first.
-        folders_to_delete_remote.sort(reverse=True)
-        folders_to_delete_local.sort(reverse=True)
-
-        print("")
-        print("Ready to sync")
-        print("")
-        actions = [
-            (to_delete_local + folders_to_delete_local, "DELETED locally"),
-            (to_delete_remote + folders_to_delete_remote, "DELETED from device"),
-            (to_upload + folders_to_create_remote, "UPLOADED to device"),
-            (to_download + folders_to_create_local, "DOWNLOADED from device"),
-        ]
-        for file_list, description in actions:
-            if file_list:
-                print(f"{len(file_list):4d} files will be {description}")
-
-        if not (
-            to_delete_local
-            or to_delete_remote
-            or to_upload
-            or to_download
-            or folders_to_delete_local
-            or folders_to_delete_remote
-            or folders_to_create_local
-            or folders_to_create_remote
-        ):
-            print("All files are in sync. Exiting.")
-            return
-
-        # Conferm that the user actually wants to perform the actions that
-        # have been prepared.
-        print("")
-        confirm = ""
-        while not (confirm in ("y", "yes") or self.assume_yes):
-            confirm = input(f"Proceed (y/n/?)? ")
-            if confirm in ("n", "no"):
-                return
-            if confirm in ("?", "list", "l"):
-                for file_list, description in actions:
-                    if file_list:
-                        print("")
-                        print(f"The following files will be {description}:")
-                        print("\t" + "\n\t".join(file_list))
-                        print("")
-
-        # Syncing can potentially take some time, so let's display a progress bar
-        # to give the user some idea about the progress.
-        # Calling print() will interfere with the progress bar, so all print calls
-        # are replaced by tqdm.write() while the progress bar is in use
-        progress_bar = tqdm(
-            total=len(to_delete_local)
-            + len(to_delete_remote)
-            + len(to_upload)
-            + len(to_download),
-            desc="Synchronizing",
-            unit="files",
-        )
-
-        # Apply changes in remote to local
-        for remote_path in to_download:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            tqdm.write("⇣ " + str(remote_path))
-            self.download_file(remote_path, local_path)
-            remote_time = (
-                file_data[remote_path]["remote_time"]
-                .replace(tzinfo=timezone.utc)
-                .astimezone(tz=None)
-            )
-            mod_time = time.mktime(remote_time.timetuple())
-            os.utime(local_path, (mod_time, mod_time))
-            progress_bar.update()
-
-        for remote_path in to_delete_local:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            if os.path.exists(local_path):
-                tqdm.write("X " + str(local_path))
-                os.remove(local_path)
-            progress_bar.update()
-
-        for remote_path in folders_to_delete_local:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            if os.path.exists(local_path):
-                tqdm.write("X " + str(local_path))
-                try:
-                    os.rmdir(local_path)
-                except OSError as e:
-                    if e.errno == 39:
-                        tqdm.write(
-                            f"WARNING: The folder {local_path} is not empty and will not be deleted."
-                        )
+                if modified_local and modified_remote:
+                    print(
+                        f"Warning, sync conflict!  {filename} is changed both locally and remotely."
+                    )
+                    if data["local_time"] > data["remote_time"]:
+                        print("Local change is newer and will take precedence.")
+                        to_upload.append(filename)
                     else:
-                        raise
-            progress_bar.update()
+                        print("Remote change is newer and will take precedence.")
+                        to_download.append(filename)
+                elif modified_local:
+                    to_upload.append(filename)
+                elif modified_remote:
+                    to_download.append(filename)
+                elif deleted_local:
+                    to_delete_remote.append(filename)
+                elif deleted_remote:
+                    to_delete_local.append(filename)
 
-        for remote_path in folders_to_create_local:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            tqdm.write("⇣ " + str(remote_path))
-            os.makedirs(local_path, exist_ok=True)
-            progress_bar.update()
+            if missing_checkpoint_files:
+                print(
+                    "\nWarning: The following files exist both locally and on the DPT, but do not seem to have been synchronized using this tool:"
+                )
 
-        # Apply changes in local to remote
-        for remote_file in to_delete_remote:
-            if self.path_exists(remote_file):
-                tqdm.write("X " + str(remote_file))
-                self.delete_document(remote_file)
-            progress_bar.update()
+                max_print = 20  # Let's only print the first max_print filenames to avoid completely flooding
+                # stdout with unusable information if missing metadata means that this happens
+                # to all files in the user's library
+                print("\t" + "\n\t".join(missing_checkpoint_files[:max_print]))
+                if len(missing_checkpoint_files) > max_print:
+                    print(
+                        f"\t... and {len(missing_checkpoint_files)-max_print} additional files"
+                    )
+                print("The files will be assumed to be identical.\n")
 
-        for remote_deletion_folder in folders_to_delete_remote:
-            if self.path_exists(remote_deletion_folder):
-                tqdm.write("X " + str(remote_deletion_folder))
-                self.delete_folder(remote_deletion_folder)
-            progress_bar.update()
+            # Just syncing the files will automatically create the necessary folders to store the given files, but it won't sync empty folders,
+            # or folder deletion. Therefore, let's go through the folder_data as well, to see which additional folder operations need to be performed:
+            folders_to_delete_remote = []
+            folders_to_delete_local = []
+            folders_to_create_remote = []
+            folders_to_create_local = []
+            from pathlib import PurePosixPath
+            _upload_implied_folders = {str(p) for path in to_upload for p in PurePosixPath(path).parents}
+            _download_implied_folders = {str(p) for path in to_download for p in PurePosixPath(path).parents}
+            for foldername, data in folder_data.items():
+                # data contains information about whether the given foldername exists locally, remotely, and in the checkpoint.
+                # In addition, we plan to upload/download some files, in which case we won't need to manually create the folders.
+                # So let's updte data to describe the expected situation after uploading/downloding those files, to decide which additional
+                # folder operations need to be performed.
+                data["remote_exists"] = data["remote_exists"] or (foldername in _upload_implied_folders)
+                data["local_exists"] = data["local_exists"] or (foldername in _download_implied_folders)
 
-        for remote_path in to_upload:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            tqdm.write("⇡ " + str(local_path))
-            self.upload_file(local_path, remote_path)
-            progress_bar.update()
+                # Depending on whether the folder exists is remote/local/checkpoint, let's decide whether to create/delete the folder from remote/local.
+                create_remote = (
+                    data["local_exists"]
+                    and (not data["checkpoint_exists"])
+                    and (not data["remote_exists"])
+                )
+                create_local = (
+                    data["remote_exists"]
+                    and (not data["checkpoint_exists"])
+                    and (not data["local_exists"])
+                )
+                delete_remote = (
+                    (not data["local_exists"])
+                    and data["checkpoint_exists"]
+                    and data["remote_exists"]
+                )
+                delete_local = (
+                    (not data["remote_exists"])
+                    and data["checkpoint_exists"]
+                    and data["local_exists"]
+                )
 
-        for remote_path in folders_to_create_remote:
-            relative_path = Path(remote_path).relative_to(remote_folder)
-            local_path = Path(local_folder) / relative_path
-            tqdm.write("⇡ " + str(local_path))
-            self.new_folder(remote_path)
-            progress_bar.update()
+                if create_remote:
+                    folders_to_create_remote.append(foldername)
+                if create_local:
+                    folders_to_create_local.append(foldername)
+                if delete_remote:
+                    folders_to_delete_remote.append(foldername)
+                if delete_local:
+                    folders_to_delete_local.append(foldername)
 
-        progress_bar.close()
+            # If a folder structure is deleted, let's sort the deletion so that we always select the innermost, empty, folder first.
+            folders_to_delete_remote.sort(reverse=True)
+            folders_to_delete_local.sort(reverse=True)
 
-        print("Refreshing file information... ", end="", flush=True)
-        remote_info = self.traverse_folder(
-            remote_folder, fields=["entry_path", "modified_date", "entry_type"]
-        )
-        self.sync_checkpoint(local_folder, remote_info)
-        print("done")
+            print("")
+            print("Ready to sync")
+            print("")
+            actions = [
+                (to_delete_local + folders_to_delete_local, "DELETED locally"),
+                (to_delete_remote + folders_to_delete_remote, "DELETED from device"),
+                (to_upload + folders_to_create_remote, "UPLOADED to device"),
+                (to_download + folders_to_create_local, "DOWNLOADED from device"),
+            ]
+            for file_list, description in actions:
+                if file_list:
+                    print(f"{len(file_list):4d} files will be {description}")
+
+            # Show ignored files count (reuse data already collected during local traversal)
+            ignored_count_total = sum(1 for d in file_data.values() if d.get("ignored", False))
+            if ignored_count_total > 0:
+                print(f"{ignored_count_total:4d} files are IGNORED (use list-ignored-files to see them)")
+
+            if not (
+                to_delete_local
+                or to_delete_remote
+                or to_upload
+                or to_download
+                or folders_to_delete_local
+                or folders_to_delete_remote
+                or folders_to_create_local
+                or folders_to_create_remote
+            ):
+                print("All files are in sync. Exiting.")
+                return
+
+            # Conferm that the user actually wants to perform the actions that
+            # have been prepared.
+            print("")
+            confirm = ""
+            while not (confirm in ("y", "yes") or self.assume_yes):
+                confirm = input("Proceed (y/n/?/ig)? ")
+                if confirm in ("n", "no"):
+                    return
+                if confirm in ("?", "list", "l"):
+                    for file_list, description in actions:
+                        if file_list:
+                            print("")
+                            print(f"The following files will be {description}:")
+                            print("\t" + "\n\t".join(file_list))
+                            print("")
+                if confirm in ("ig", "ignore"):
+                    # Show files that can be ignored (upload and download files)
+                    files_to_ignore = []
+                    file_sources = []  # Track whether each file is from upload or download
+
+                    if to_upload:
+                        print("\nFiles to be UPLOADED (can be ignored):")
+                        for i, file_path in enumerate(to_upload):
+                            print(f"{len(files_to_ignore)+1:3d}: {file_path} [UPLOAD]")
+                            files_to_ignore.append(file_path)
+                            file_sources.append('upload')
+
+                    if to_download:
+                        print("\nFiles to be DOWNLOADED (can be ignored):")
+                        for i, file_path in enumerate(to_download):
+                            print(f"{len(files_to_ignore)+1:3d}: {file_path} [DOWNLOAD]")
+                            files_to_ignore.append(file_path)
+                            file_sources.append('download')
+
+                    if files_to_ignore:
+                        print("\nEnter file numbers to ignore (space-separated, e.g., '1 3 5'), or 'all' for all files:")
+                        selection = input("Files to ignore: ").strip()
+
+                        if selection.lower() == 'all':
+                            # Add all files to ignore
+                            ignored_count = 0
+                            for file_path in files_to_ignore:
+                                relative_path = str(Path(file_path).relative_to(remote_folder))
+                                filename = os.path.basename(relative_path)
+                                if self.add_ignore_pattern(local_folder, filename):
+                                    ignored_count += 1
+                            print(f"Added {ignored_count} files to ignore list")
+                        elif selection:
+                            try:
+                                indices = [int(x) - 1 for x in selection.split()]
+                                ignored_count = 0
+                                for idx in indices:
+                                    if 0 <= idx < len(files_to_ignore):
+                                        file_path = files_to_ignore[idx]
+                                        relative_path = str(Path(file_path).relative_to(remote_folder))
+                                        filename = os.path.basename(relative_path)
+                                        if self.add_ignore_pattern(local_folder, filename):
+                                            ignored_count += 1
+                                            source = file_sources[idx].upper()
+                                            print(f"Added to ignore: {filename} [{source}]")
+                                print(f"Added {ignored_count} files to ignore list")
+                            except ValueError:
+                                print("Invalid selection. Please enter numbers separated by spaces.")
+
+                        # Ask if user wants to restart sync with new ignore patterns
+                        restart = input("Restart sync with new ignore patterns? (y/n): ").strip().lower()
+                        if restart in ("y", "yes"):
+                            print("Restarting sync...")
+                            should_restart = True
+                            break
+                    else:
+                        print("No files available to ignore.")
+            if should_restart:
+                continue
+
+            # Syncing can potentially take some time, so let's display a progress bar
+            # to give the user some idea about the progress.
+            # Calling print() will interfere with the progress bar, so all print calls
+            # are replaced by tqdm.write() while the progress bar is in use
+            progress_bar = tqdm(
+                total=len(to_delete_local)
+                + len(to_delete_remote)
+                + len(to_upload)
+                + len(to_download),
+                desc="Synchronizing",
+                unit="files",
+            )
+
+            try:
+                # Apply changes in remote to local
+                def _download_one(remote_path):
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    tqdm.write("⇣ " + str(remote_path))
+                    self.download_file(remote_path, local_path)
+                    remote_time = (
+                        file_data[remote_path]["remote_time"]
+                        .replace(tzinfo=timezone.utc)
+                        .astimezone(tz=None)
+                    )
+                    mod_time = time.mktime(remote_time.timetuple())
+                    os.utime(local_path, (mod_time, mod_time))
+                    progress_bar.update()
+
+                _download_errors = []
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    _futures = {pool.submit(_download_one, p): p for p in to_download}
+                    for f in as_completed(_futures):
+                        try:
+                            f.result()
+                        except Exception as exc:
+                            _download_errors.append((_futures[f], exc))
+                if _download_errors:
+                    for path, exc in _download_errors:
+                        tqdm.write(f"FAILED download: {path}: {exc}")
+
+                for remote_path in to_delete_local:
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    if os.path.exists(local_path):
+                        tqdm.write("X " + str(local_path))
+                        os.remove(local_path)
+                    progress_bar.update()
+
+                for remote_path in folders_to_delete_local:
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    if os.path.exists(local_path):
+                        tqdm.write("X " + str(local_path))
+                        try:
+                            os.rmdir(local_path)
+                        except OSError as e:
+                            if e.errno == errno.ENOTEMPTY:
+                                tqdm.write(
+                                    f"WARNING: The folder {local_path} is not empty and will not be deleted."
+                                )
+                            else:
+                                raise
+                    progress_bar.update()
+
+                for remote_path in folders_to_create_local:
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    tqdm.write("⇣ " + str(remote_path))
+                    os.makedirs(local_path, exist_ok=True)
+                    progress_bar.update()
+
+                # Apply changes in local to remote
+                for remote_file in to_delete_remote:
+                    if self.path_exists(remote_file):
+                        tqdm.write("X " + str(remote_file))
+                        self.delete_document(remote_file)
+                    progress_bar.update()
+
+                for remote_deletion_folder in folders_to_delete_remote:
+                    if self.path_exists(remote_deletion_folder):
+                        tqdm.write("X " + str(remote_deletion_folder))
+                        self.delete_folder(remote_deletion_folder)
+                    progress_bar.update()
+
+                def _upload_one(remote_path):
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    tqdm.write("⇡ " + str(local_path))
+                    self.upload_file(local_path, remote_path)
+                    progress_bar.update()
+
+                _upload_errors = []
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    _futures = {pool.submit(_upload_one, p): p for p in to_upload}
+                    for f in as_completed(_futures):
+                        try:
+                            f.result()
+                        except Exception as exc:
+                            _upload_errors.append((_futures[f], exc))
+                if _upload_errors:
+                    for path, exc in _upload_errors:
+                        tqdm.write(f"FAILED upload: {path}: {exc}")
+
+                for remote_path in folders_to_create_remote:
+                    relative_path = Path(remote_path).relative_to(remote_folder)
+                    local_path = Path(local_folder) / relative_path
+                    tqdm.write("⇡ " + str(local_path))
+                    self.new_folder(remote_path)
+                    progress_bar.update()
+            finally:
+                progress_bar.close()
+
+            print("Refreshing file information... ", end="", flush=True)
+            remote_info = self.traverse_folder(
+                remote_folder, fields=["entry_path", "modified_date", "entry_type"]
+            )
+            self.sync_checkpoint(local_folder, remote_info)
+            print("done")
 
     def load_checkpoint(self, local_folder):
         checkpoint_file = os.path.join(local_folder, ".sync")
@@ -920,6 +1158,161 @@ class DigitalPaper:
         checkpoint_file = os.path.join(local_folder, ".sync")
         with open(checkpoint_file, "wb") as f:
             pickle.dump(doclist, f)
+
+    def load_ignore_patterns(self, local_folder: str) -> list[str]:
+        """Load active (non-comment) ignore patterns from .syncignore file.
+
+        Args:
+            local_folder: Path to the local sync folder containing .syncignore.
+
+        Returns:
+            List of active pattern strings (comments and blank lines excluded).
+        """
+        ignore_file = Path(local_folder) / ".syncignore"
+        if not ignore_file.exists():
+            return []
+        patterns = []
+        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                patterns.append(stripped)
+        return patterns
+
+    def save_ignore_patterns(self, local_folder: str, patterns: list[str]) -> None:
+        """Save ignore patterns to .syncignore file, preserving existing comments.
+
+        Comment lines and blank lines from the existing file are retained.
+        New patterns not already present are appended at the end.
+
+        Args:
+            local_folder: Path to the local sync folder containing .syncignore.
+            patterns: Full list of active patterns to store.
+        """
+        ignore_file = Path(local_folder) / ".syncignore"
+        existing_lines: list[str] = []
+        existing_patterns: list[str] = []
+
+        if ignore_file.exists():
+            for line in ignore_file.read_text(encoding="utf-8").splitlines():
+                existing_lines.append(line)
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    existing_patterns.append(stripped)
+
+        # Rewrite keeping comments; remove patterns no longer active; append new ones.
+        output_lines: list[str] = []
+        for line in existing_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                output_lines.append(line)  # keep blank lines and comments unchanged
+            elif stripped in patterns:
+                output_lines.append(line)  # keep active patterns
+            # else: pattern was removed — omit the line
+
+        # Append patterns not already present in the file
+        for pattern in patterns:
+            if pattern not in existing_patterns:
+                output_lines.append(pattern)
+
+        ignore_file.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+    def add_ignore_pattern(self, local_folder: str, pattern: str) -> bool:
+        """Add a pattern to the .syncignore list if not already present.
+
+        Note: patterns are matched against the filename only (basename), not the full
+        relative path. Adding ``subdir/file.pdf`` stores ``file.pdf`` and will ignore
+        ALL files with that name in any subdirectory.
+
+        Args:
+            local_folder: Path to the local sync folder containing .syncignore.
+            pattern: Shell-glob pattern (supports ``*``, ``?``).
+
+        Returns:
+            True if the pattern was added; False if it already existed.
+        """
+        patterns = self.load_ignore_patterns(local_folder)
+        if pattern not in patterns:
+            patterns.append(pattern)
+            self.save_ignore_patterns(local_folder, patterns)
+            return True
+        return False
+
+    def remove_ignore_pattern(self, local_folder: str, pattern: str) -> bool:
+        """Remove a pattern from the .syncignore list.
+
+        Args:
+            local_folder: Path to the local sync folder containing .syncignore.
+            pattern: Pattern to remove (must match exactly).
+
+        Returns:
+            True if removed; False if the pattern was not found.
+        """
+        patterns = self.load_ignore_patterns(local_folder)
+        if pattern in patterns:
+            patterns.remove(pattern)
+            self.save_ignore_patterns(local_folder, patterns)
+            return True
+        return False
+
+    def is_ignored(self, file_path: str, patterns: list[str]) -> bool:
+        """Return True if ``file_path`` matches any pattern in ``patterns``.
+
+        Patterns are matched against both the filename (basename) and the full
+        relative path using ``fnmatch`` shell-glob rules.
+
+        Args:
+            file_path: Relative file path to test.
+            patterns: List of shell-glob patterns from .syncignore.
+        """
+        filename = os.path.basename(file_path)
+        for pattern in patterns:
+            if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(file_path, pattern):
+                return True
+        return False
+
+    def list_ignored_files(self, local_folder: str) -> list[str]:
+        """Return relative paths of all PDF files that would be excluded by .syncignore.
+
+        Only PDF files are returned since sync only transfers PDFs.
+
+        Args:
+            local_folder: Path to the local sync folder.
+
+        Returns:
+            List of relative path strings matching any .syncignore pattern.
+        """
+        patterns = self.load_ignore_patterns(local_folder)
+        if not patterns:
+            return []
+
+        ignored_files = []
+        visited_paths = set()  # Track visited directories to prevent infinite recursion
+
+        def traverse_for_ignored(path, depth=0):
+            # Prevent infinite recursion due to circular symlinks or deep nesting
+            if depth > _MAX_LOCAL_TRAVERSAL_DEPTH:
+                return
+
+            try:
+                # Get the real path to handle symlinks
+                real_path = os.path.realpath(path)
+                if real_path in visited_paths:
+                    return  # Already visited this directory
+                visited_paths.add(real_path)
+
+                for entry in os.scandir(path):
+                    if entry.is_dir():
+                        traverse_for_ignored(entry.path, depth + 1)
+                    elif entry.name.lower().endswith(".pdf") and not entry.name.startswith("."):
+                        relative_path = Path(entry.path).relative_to(local_folder)
+                        if self.is_ignored(str(relative_path), patterns):
+                            ignored_files.append(str(relative_path))
+            except (OSError, ValueError):
+                # Skip directories that can't be accessed or processed
+                pass
+
+        traverse_for_ignored(local_folder)
+        return ignored_files
 
     def _copy_move_data(self, file_id, folder_id, new_filename=None):
         data = {"parent_folder_id": folder_id}
@@ -1064,14 +1457,14 @@ class DigitalPaper:
         Input uses the same format that get_config() returns.
         """
         for key, setting in config.items():
-            data = self._put_endpoint("/system/configs/" + key, data=setting)
+            self._put_endpoint("/system/configs/" + key, data=setting)
 
     def get_timeout(self):
         data = self._get_endpoint("/system/configs/timeout_to_standby").json()
         return data["value"]
 
     def set_timeout(self, value):
-        data = self._put_endpoint(
+        self._put_endpoint(
             "/system/configs/timeout_to_standby", data={"value": value}
         )
 
@@ -1080,28 +1473,28 @@ class DigitalPaper:
         return data["value"]
 
     def set_date_format(self, value):
-        data = self._put_endpoint("/system/configs/date_format", data={"value": value})
+        self._put_endpoint("/system/configs/date_format", data={"value": value})
 
     def get_time_format(self):
         data = self._get_endpoint("/system/configs/time_format").json()
         return data["value"]
 
     def set_time_format(self, value):
-        data = self._put_endpoint("/system/configs/time_format", data={"value": value})
+        self._put_endpoint("/system/configs/time_format", data={"value": value})
 
     def get_timezone(self):
         data = self._get_endpoint("/system/configs/timezone").json()
         return data["value"]
 
     def set_timezone(self, value):
-        data = self._put_endpoint("/system/configs/timezone", data={"value": value})
+        self._put_endpoint("/system/configs/timezone", data={"value": value})
 
     def get_owner(self):
         data = self._get_endpoint("/system/configs/owner").json()
         return data["value"]
 
     def set_owner(self, value):
-        data = self._put_endpoint("/system/configs/owner", data={"value": value})
+        self._put_endpoint("/system/configs/owner", data={"value": value})
 
     ### System info
 
@@ -1131,7 +1524,7 @@ class DigitalPaper:
         return data
 
     def set_datetime(self):
-        now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        now = datetime.now(tz=timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z"
         self._put_endpoint("/system/configs/datetime", data={"value": now})
 
     ### Etc
@@ -1154,7 +1547,7 @@ class DigitalPaper:
 
     def update_firmware(self, fwfh):
         filename = "FwUpdater.pkg"
-        fw_url = "/system/controls/update_firmware/file".format(base_url=self.base_url)
+        fw_url = "/system/controls/update_firmware/file".format()
         files = {"file": (quote_plus(filename), fwfh, "rb")}
         # TODO: add file transferring feedback
         self._put_endpoint(fw_url, files=files)
@@ -1236,8 +1629,8 @@ def pad(bytestring, k=16):
     Pad an input bytestring according to PKCS#7
 
     """
-    l = len(bytestring)
-    val = k - (l % k)
+    length = len(bytestring)
+    val = k - (length % k)
     return bytestring + bytearray([val] * val)
 
 
@@ -1268,5 +1661,5 @@ def unpad(bytestring, k=16):
     val = bytestring[-1]
     if val > k:
         raise ValueError("Input is not padded or padding is corrupt")
-    l = len(bytestring) - val
-    return bytestring[:l]
+    length = len(bytestring) - val
+    return bytestring[:length]

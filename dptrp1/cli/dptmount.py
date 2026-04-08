@@ -34,27 +34,26 @@ upload functionality by Jochen Schroeder <cycomanic@gmail.com>
 # debian-dependency: python3-fusepy
 # pip3 install fusepy
 
+import calendar
+import io
+import logging
 import os
 import sys
-import errno
 import time
-import calendar
-import yaml
-import io
-from errno import ENOENT, EACCES
-from stat import S_IFDIR, S_IFLNK, S_IFREG
-
-import logging
-
-logger = logging.getLogger("dptmount")
-
-try:
-    from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
-except ModuleNotFoundError:
-    from fusepy import FUSE, FuseOSError, Operations, LoggingMixIn
-from dptrp1.dptrp1 import DigitalPaper, find_auth_files
+from errno import EACCES, ENOENT
+from stat import S_IFDIR, S_IFREG
 
 import anytree
+import yaml
+
+try:
+    from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
+except ModuleNotFoundError:
+    from fusepy import FUSE, FuseOSError, LoggingMixIn, Operations  # type: ignore[no-redef]
+
+from dptrp1.dptrp1 import DigitalPaper, find_auth_files
+
+logger = logging.getLogger("dptmount")
 
 class FileHandle(object):
 
@@ -253,8 +252,7 @@ class DptTablet(LoggingMixIn, Operations):
 
     def unlink(self, path):
         node = self._map_local_remote(path)
-        remote_path = node.remote_path
-        data = self.dpt.delete_document(node.remote_path)
+        self.dpt.delete_document(node.remote_path)
         self._remove_node(node)
         return 0
 
@@ -271,7 +269,7 @@ class DptTablet(LoggingMixIn, Operations):
         parent = self._map_local_remote(ppath)
         remote_path = os.path.join(parent.remote_path, dirname)
         self.dpt.new_folder(remote_path)
-        node = self._add_remote_path_to_tree(parent, remote_path)
+        self._add_remote_path_to_tree(parent, remote_path)
         return 0
 
     # File methods
@@ -287,7 +285,6 @@ class DptTablet(LoggingMixIn, Operations):
     def release(self, path, fh):
         # TODO: something is going wrong with releasing the file handles for new created docs
         logger.info("file handle %d closed" % fh)
-        node = self._map_local_remote(path)
         del self.handle[fh]
         return 0
 
@@ -384,7 +381,7 @@ def main():
     )
 
     tablet = DptTablet(**params)
-    fuse = FUSE(
+    FUSE(
         tablet,
         args.mountpoint,
         foreground=True,
