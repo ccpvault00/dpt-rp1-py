@@ -18,7 +18,6 @@ from glob import glob
 from pathlib import Path
 from urllib.parse import quote_plus
 
-import httpsig
 import requests
 import urllib3
 import urllib3.util.connection as _urllib3_conn
@@ -26,6 +25,7 @@ from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 from Crypto.Hash.HMAC import HMAC
 from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
 from pbkdf2 import PBKDF2
 from tqdm import tqdm
 
@@ -414,9 +414,14 @@ class DigitalPaper:
         )
 
     def authenticate(self, client_id, key):
-        sig_maker = httpsig.Signer(secret=key, algorithm="rsa-sha256")
+        if isinstance(key, str):
+            key = key.encode("ascii")
         nonce = self._get_nonce(client_id)
-        signed_nonce = sig_maker.sign(nonce)
+        nonce_bytes = nonce.encode("ascii") if isinstance(nonce, str) else nonce
+        h = SHA256.new(nonce_bytes)
+        signed_nonce = base64.b64encode(
+            pkcs1_15.new(RSA.import_key(key)).sign(h)
+        ).decode("ascii")
         url = "{base_url}/auth".format(base_url=self.base_url)
         data = {"client_id": client_id, "nonce_signed": signed_nonce}
         r = self.session.put(url, json=data)
