@@ -4,9 +4,8 @@
 
 """ Pure Python Diffie Hellman implementation """
 
-import os
 import binascii
-import hashlib
+import os
 
 # RFC 3526 - More Modular Exponential (MODP) Diffie-Hellman groups for
 # Internet Key Exchange (IKE) https://tools.ietf.org/html/rfc3526
